@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, List
 app = FastAPI(
     title="DatePublic API - Motor de Ingeniería CUI Perú",
     description="Buscador multi-recurso sobre api.datosabiertos.mef.gob.pe con autodescubrimiento de esquema",
-    version="3.0.0"
+    version="3.0.1"
 )
 
 app.add_middleware(
@@ -22,7 +22,6 @@ CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
 CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
 CKAN_SQL = f"{CKAN_BASE}/datastore_search_sql"
 
-# ID principal de Detalle de Inversiones + caché en memoria
 PRIMARY_RESOURCE_ID = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"
 SCHEMA_CACHE: Dict[str, List[Dict[str, str]]] = {}
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -50,9 +49,6 @@ async def obtener_esquema_recurso(client: httpx.AsyncClient, resource_id: str) -
 
 
 def detectar_columnas_cui(fields: List[Dict[str, str]]) -> List[str]:
-    """
-    Identifica automáticamente qué columnas del dataset almacenan el CUI o código SNIP.
-    """
     candidatas = []
     keywords = ["UNICO", "CUI", "CODIGO", "INVERSION", "PROYECTO", "SNIP", "COD_"]
     for f in fields:
@@ -61,7 +57,6 @@ def detectar_columnas_cui(fields: List[Dict[str, str]]) -> List[str]:
             continue
         if any(k in col_id.upper() for k in keywords):
             candidatas.append(col_id)
-    # Si no hay nombres obvios, devolver las primeras 4 columnas
     return candidatas if candidatas else [f.get("id") for f in fields if f.get("id") != "_id"][:4]
 
 
@@ -78,17 +73,17 @@ async def buscar_cui_en_recurso_ckan(
     columnas_cui = detectar_columnas_cui(fields)
     debug_log["columnas_detectadas_en_mef"] = columnas_cui
 
-    # Estrategia A: Consulta por filtros exactos en las columnas candidatas (String, Int y Float)
+    # Estrategia A: Consulta por filtros exactos en las columnas candidatas
     tareas_filtros = []
-     Variaciones = [f'"{cui}"', f'{int(cui)}', f'"{cui}.0"']
+    variaciones = [f'"{cui}"', f'{int(cui)}', f'"{cui}.0"']
     for col in columnas_cui[:4]:
-        for val in Variaciones[:2]:
+        for val in variaciones[:2]:
             filtro_json = f'{{"{col}":{val}}}'
             tareas_filtros.append(
                 client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": filtro_json, "limit": 1}, timeout=10.0)
             )
 
-    # Estrategia B: Consulta SQL directa en PostgreSQL de CKAN (CAST a texto para evitar error de tipos)
+    # Estrategia B: Consulta SQL directa en PostgreSQL de CKAN
     if columnas_cui:
         condiciones_sql = " OR ".join([f'CAST("{col}" AS TEXT) LIKE \'{cui}%\'' for col in columnas_cui[:3]])
         sql_query = f'SELECT * FROM "{resource_id}" WHERE {condiciones_sql} LIMIT 1'
@@ -108,7 +103,7 @@ async def buscar_cui_en_recurso_ckan(
             except Exception:
                 continue
 
-    # Estrategia C: Búsqueda Full-Text con formato decimal ("2137718" o "2137718.0")
+    # Estrategia C: Búsqueda Full-Text con formato entero y decimal
     for q_val in [cui, f"{cui}.0"]:
         try:
             r_q = await client.get(CKAN_SEARCH, params={"resource_id": resource_id, "q": q_val, "limit": 5}, timeout=10.0)
@@ -124,16 +119,13 @@ async def buscar_cui_en_recurso_ckan(
 
 
 # =========================================================
-# 3. NODO DE RESPALDO PÚBLICO (SI EL CUI ES ANTIGUO O NO ESTÁ EN ESE CSV)
+# 3. NODO DE RESPALDO PÚBLICO (BRIDGE INVIERTE.PE)
 # =========================================================
 async def verificar_cui_fuentes_abiertas(
     client: httpx.AsyncClient,
     cui: str,
     debug_log: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """
-    Usa APIs abiertas sin CAPTCHA (Brave/Jina/Wikipedia/Gob.pe) que no devuelven HTTP 202 en Render.
-    """
     urls_consulta = [
         f"https://r.jina.ai/https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
         f"https://r.jina.ai/https://ofi5.mef.gob.pe/invierte/ejecucion/verFichaEjecucion/{cui}"
@@ -159,22 +151,17 @@ async def verificar_cui_fuentes_abiertas(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v3.0 - Ingeniería CUI",
+        "servicio": "DatePublic API v3.0.1 - Ingeniería CUI",
         "estado": "operativo",
         "endpoints": {
             "esquema_real_mef": "/api/v1/esquema-mef",
-            "buscar_obra": "/api/v1/obra/{cui}",
-            "debug_completo": "/api/v1/debug/{cui}"
+            "buscar_obra": "/api/v1/obra/{cui}"
         }
     }
 
 
 @app.get("/api/v1/esquema-mef")
 async def inspeccionar_columnas_mef():
-    """
-    Muestra exactamente qué columnas y qué datos tiene el recurso CKAN del MEF.
-    Úsalo en el navegador para ver cómo guarda el MEF los CUI.
-    """
     async with httpx.AsyncClient(headers=HEADERS, verify=False) as client:
         resp = await client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 3}, timeout=15.0)
         if resp.status_code != 200:
@@ -197,16 +184,13 @@ async def consultar_obra_cui(cui: str):
     if len(set(cui_clean)) == 1:
         raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} es un código inválido.")
 
-    # 1. Revisar caché en memoria (respuesta en < 2ms)
     if cui_clean in CUI_MEMORY_CACHE:
         return CUI_MEMORY_CACHE[cui_clean]
 
     debug_log: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        # Paso A: Buscar con autodescubrimiento de columnas y SQL en el CKAN del MEF
         registro_ckan = await buscar_cui_en_recurso_ckan(client, PRIMARY_RESOURCE_ID, cui_clean, debug_log)
 
-        # Paso B: Si no está en ese archivo específico, usar el Bridge hacia ofi5.mef.gob.pe
         registro_bridge = None
         if not registro_ckan:
             registro_bridge = await verificar_cui_fuentes_abiertas(client, cui_clean, debug_log)

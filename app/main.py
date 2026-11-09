@@ -2,12 +2,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor de Ingeniería CUI Perú",
-    description="Buscador multi-recurso sobre api.datosabiertos.mef.gob.pe con autodescubrimiento de esquema",
-    version="3.0.1"
+    description="Parser adaptativo para la estructura real de api.datosabiertos.mef.gob.pe",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -18,13 +18,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
-CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
-CKAN_SQL = f"{CKAN_BASE}/datastore_search_sql"
-
+CKAN_SEARCH = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1/datastore_search"
 PRIMARY_RESOURCE_ID = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"
-SCHEMA_CACHE: Dict[str, List[Dict[str, str]]] = {}
+
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
+DETECTED_COLUMNS_CACHE: List[str] = []
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36",
@@ -33,144 +31,188 @@ HEADERS = {
 
 
 # =========================================================
-# 1. INSPECTOR DE ESQUEMA CKAN (DESCUBRE COLUMNAS REALES)
+# 1. EXTRACTOR UNIVERSAL DE FILAS Y COLUMNAS DEL MEF
 # =========================================================
-async def obtener_esquema_recurso(client: httpx.AsyncClient, resource_id: str) -> List[Dict[str, str]]:
-    if resource_id in SCHEMA_CACHE:
-        return SCHEMA_CACHE[resource_id]
+def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
+    """
+    Sin importar cómo envuelva el API Gateway del MEF el JSON:
+    - Lista directa: [ {...}, {...} ]
+    - Raíz directa: { "records": [...], "total": ... }
+    - Estándar CKAN: { "result": { "records": [...] } }
+    - Envoltorio data/items: { "data": [...] }
+    Extrae y devuelve siempre la lista de diccionarios (filas).
+    """
+    if isinstance(raw_json, list):
+        return [r for r in raw_json if isinstance(r, dict)]
 
-    resp = await client.get(CKAN_SEARCH, params={"resource_id": resource_id, "limit": 1}, timeout=12.0)
-    if resp.status_code == 200:
-        data = resp.json()
-        fields = data.get("result", {}).get("fields", [])
-        SCHEMA_CACHE[resource_id] = fields
-        return fields
+    if isinstance(raw_json, dict):
+        # Caso 1: "records" o "data" directo en la raíz
+        for key in ["records", "data", "items", "rows", "registros"]:
+            if isinstance(raw_json.get(key), list):
+                return raw_json[key]
+
+        # Caso 2: Dentro de "result" o "response"
+        for parent in ["result", "response", "body", "payload"]:
+            sub = raw_json.get(parent)
+            if isinstance(sub, list):
+                return sub
+            if isinstance(sub, dict):
+                for key in ["records", "data", "items", "rows"]:
+                    if isinstance(sub.get(key), list):
+                        return sub[key]
+
+        # Caso 3: Buscar cualquier lista de diccionarios en el primer nivel
+        for val in raw_json.values():
+            if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
+                return val
+
     return []
 
 
-def detectar_columnas_cui(fields: List[Dict[str, str]]) -> List[str]:
-    candidatas = []
-    keywords = ["UNICO", "CUI", "CODIGO", "INVERSION", "PROYECTO", "SNIP", "COD_"]
-    for f in fields:
-        col_id = f.get("id", "")
-        if col_id == "_id":
+def descubrir_columnas_cui_desde_filas(records: List[Dict[str, Any]]) -> List[str]:
+    if not records:
+        return []
+    primera_fila = records[0]
+    todas_las_columnas = list(primera_fila.keys())
+
+    keywords = ["UNICO", "CUI", "CODIGO", "INVERSION", "PROYECTO", "SNIP", "COD"]
+    prioritarias = [col for col in todas_las_columnas if any(k in col.upper() for k in keywords)]
+
+    # También detectar columnas cuyos valores sean números de 6 a 8 dígitos (como 2641470)
+    for col, val in primera_fila.items():
+        val_str = str(val).strip().split(".")[0]
+        if val_str.isdigit() and 6 <= len(val_str) <= 8 and col not in prioritarias and col != "_id":
+            prioritarias.append(col)
+
+    return prioritarias if prioritarias else todas_las_columnas[:5]
+
+
+def fila_contiene_cui(row: Dict[str, Any], cui: str) -> bool:
+    for v in row.values():
+        if v is None:
             continue
-        if any(k in col_id.upper() for k in keywords):
-            candidatas.append(col_id)
-    return candidatas if candidatas else [f.get("id") for f in fields if f.get("id") != "_id"][:4]
+        limpio = str(v).strip().split(".")[0]
+        if limpio == cui or cui in str(v):
+            return True
+    return False
 
 
 # =========================================================
-# 2. BUSCADOR MULTI-ESTRATEGIA EN CKAN (SQL + FILTERS + Q)
+# 2. MOTOR DE BÚSQUEDA ADAPTATIVO SOBRE EL MEF
 # =========================================================
-async def buscar_cui_en_recurso_ckan(
+async def buscar_cui_en_mef(
     client: httpx.AsyncClient,
-    resource_id: str,
     cui: str,
     debug_log: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    fields = await obtener_esquema_recurso(client, resource_id)
-    columnas_cui = detectar_columnas_cui(fields)
-    debug_log["columnas_detectadas_en_mef"] = columnas_cui
+    global DETECTED_COLUMNS_CACHE
 
-    # Estrategia A: Consulta por filtros exactos en las columnas candidatas
-    tareas_filtros = []
-    variaciones = [f'"{cui}"', f'{int(cui)}', f'"{cui}.0"']
-    for col in columnas_cui[:4]:
-        for val in variaciones[:2]:
-            filtro_json = f'{{"{col}":{val}}}'
-            tareas_filtros.append(
-                client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": filtro_json, "limit": 1}, timeout=10.0)
+    # Paso 1: Si aún no conocemos las columnas reales del MEF, traemos 1 fila real
+    if not DETECTED_COLUMNS_CACHE:
+        try:
+            r_sample = await client.get(
+                CKAN_SEARCH,
+                params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 2},
+                timeout=12.0
             )
+            debug_log["sample_http_status"] = r_sample.status_code
+            if r_sample.status_code == 200:
+                raw_sample = r_sample.json()
+                debug_log["llaves_raiz_json_mef"] = list(raw_sample.keys()) if isinstance(raw_sample, dict) else "LISTA_DIRECTA"
+                filas_muestra = extraer_records_de_respuesta_mef(raw_sample)
+                if filas_muestra:
+                    DETECTED_COLUMNS_CACHE = descubrir_columnas_cui_desde_filas(filas_muestra)
+                    debug_log["ejemplo_fila_1_llaves"] = list(filas_muestra[0].keys())
+        except Exception as e:
+            debug_log["sample_error"] = str(e)
 
-    # Estrategia B: Consulta SQL directa en PostgreSQL de CKAN
-    if columnas_cui:
-        condiciones_sql = " OR ".join([f'CAST("{col}" AS TEXT) LIKE \'{cui}%\'' for col in columnas_cui[:3]])
-        sql_query = f'SELECT * FROM "{resource_id}" WHERE {condiciones_sql} LIMIT 1'
-        tareas_filtros.append(
-            client.get(CKAN_SQL, params={"sql": sql_query}, timeout=12.0)
+    debug_log["columnas_cui_usadas"] = DETECTED_COLUMNS_CACHE
+
+    # Paso 2: Lanzar consultas en paralelo con ?q= y con ?filters= sobre las columnas reales descubiertas
+    consultas = [
+        # Búsqueda con q= texto entero y decimal
+        client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "q": cui, "limit": 15}, timeout=15.0),
+        client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "q": f"{cui}.0", "limit": 15}, timeout=15.0),
+    ]
+
+    for col in DETECTED_COLUMNS_CACHE[:4]:
+        # Probar filtro como string y como número entero
+        consultas.append(
+            client.get(
+                CKAN_SEARCH,
+                params={"resource_id": PRIMARY_RESOURCE_ID, "filters": f'{{"{col}":"{cui}"}}', "limit": 5},
+                timeout=15.0
+            )
+        )
+        consultas.append(
+            client.get(
+                CKAN_SEARCH,
+                params={"resource_id": PRIMARY_RESOURCE_ID, "filters": f'{{"{col}":{int(cui)}}}', "limit": 5},
+                timeout=15.0
+            )
         )
 
-    respuestas = await asyncio.gather(*tareas_filtros, return_exceptions=True)
+    respuestas = await asyncio.gather(*consultas, return_exceptions=True)
 
-    for r in respuestas:
-        if isinstance(r, httpx.Response) and r.status_code == 200:
+    for idx, resp in enumerate(respuestas):
+        if isinstance(resp, httpx.Response) and resp.status_code == 200:
             try:
-                body = r.json()
-                records = body.get("result", {}).get("records", [])
+                raw_data = resp.json()
+                records = extraer_records_de_respuesta_mef(raw_data)
                 if records:
-                    return records[0]
+                    for row in records:
+                        if fila_contiene_cui(row, cui):
+                            debug_log["estrategia_ganadora_idx"] = idx
+                            return row
+                    # Si un filtro exacto devolvió una fila, retornarla
+                    if idx >= 2 and len(records) == 1:
+                        return records[0]
             except Exception:
                 continue
 
-    # Estrategia C: Búsqueda Full-Text con formato entero y decimal
-    for q_val in [cui, f"{cui}.0"]:
-        try:
-            r_q = await client.get(CKAN_SEARCH, params={"resource_id": resource_id, "q": q_val, "limit": 5}, timeout=10.0)
-            if r_q.status_code == 200:
-                recs = r_q.json().get("result", {}).get("records", [])
-                for row in recs:
-                    if any(str(v).strip().startswith(cui) for v in row.values() if v is not None):
-                        return row
-        except Exception:
-            pass
-
     return None
 
 
 # =========================================================
-# 3. NODO DE RESPALDO PÚBLICO (BRIDGE INVIERTE.PE)
-# =========================================================
-async def verificar_cui_fuentes_abiertas(
-    client: httpx.AsyncClient,
-    cui: str,
-    debug_log: Dict[str, Any]
-) -> Optional[Dict[str, Any]]:
-    urls_consulta = [
-        f"https://r.jina.ai/https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
-        f"https://r.jina.ai/https://ofi5.mef.gob.pe/invierte/ejecucion/verFichaEjecucion/{cui}"
-    ]
-    for url in urls_consulta:
-        try:
-            resp = await client.get(url, headers={"Accept": "application/json"}, timeout=15.0)
-            debug_log[f"bridge_{url.split('/')[-1][:15]}"] = resp.status_code
-            if resp.status_code == 200 and cui in resp.text and len(resp.text) > 200:
-                return {
-                    "CODIGO_UNICO": cui,
-                    "fuente": "Bridge Oficial MEF Invierte.pe",
-                    "contenido_extraido": resp.text[:800]
-                }
-        except Exception as e:
-            debug_log["bridge_error"] = str(e)
-    return None
-
-
-# =========================================================
-# 4. ENDPOINTS DE LA API
+# 3. ENDPOINTS DE DIAGNÓSTICO Y PRODUCCIÓN
 # =========================================================
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v3.0.1 - Ingeniería CUI",
-        "estado": "operativo",
+        "servicio": "DatePublic API v4.0",
         "endpoints": {
-            "esquema_real_mef": "/api/v1/esquema-mef",
-            "buscar_obra": "/api/v1/obra/{cui}"
+            "ver_json_crudo_mef": "/api/v1/esquema-mef",
+            "consultar_cui": "/api/v1/obra/{cui}"
         }
     }
 
 
 @app.get("/api/v1/esquema-mef")
-async def inspeccionar_columnas_mef():
-    async with httpx.AsyncClient(headers=HEADERS, verify=False) as client:
-        resp = await client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 3}, timeout=15.0)
-        if resp.status_code != 200:
-            return {"status": resp.status_code, "error": resp.text[:400]}
-        data = resp.json().get("result", {})
+async def ver_json_crudo_real_del_mef():
+    """
+    Devuelve el JSON EXACTO sin recortar que entrega api.datosabiertos.mef.gob.pe
+    para ver las llaves reales, nombres de columnas y 2 filas de ejemplo.
+    """
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
+        resp = await client.get(
+            CKAN_SEARCH,
+            params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 2},
+            timeout=15.0
+        )
+        try:
+            raw_json = resp.json()
+        except Exception:
+            raw_json = resp.text[:1000]
+
+        records_extraidos = extraer_records_de_respuesta_mef(raw_json) if isinstance(raw_json, (dict, list)) else []
+        columnas_detectadas = descubrir_columnas_cui_desde_filas(records_extraidos)
+
         return {
-            "total_registros_en_este_recurso": data.get("total"),
-            "columnas_y_tipos": data.get("fields"),
-            "ejemplo_3_filas_reales": data.get("records")
+            "http_status_mef": resp.status_code,
+            "url_consultada": str(resp.url),
+            "columnas_cui_autodectadas": columnas_detectadas,
+            "filas_extraidas_por_parser": len(records_extraidos),
+            "respuesta_cruda_exacta_del_mef": raw_json
         }
 
 
@@ -182,36 +224,30 @@ async def consultar_obra_cui(cui: str):
         raise HTTPException(status_code=400, detail="El CUI debe tener entre 6 y 8 dígitos numéricos.")
 
     if len(set(cui_clean)) == 1:
-        raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} es un código inválido.")
+        raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} es un patrón inválido.")
 
     if cui_clean in CUI_MEMORY_CACHE:
         return CUI_MEMORY_CACHE[cui_clean]
 
     debug_log: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        registro_ckan = await buscar_cui_en_recurso_ckan(client, PRIMARY_RESOURCE_ID, cui_clean, debug_log)
+        registro = await buscar_cui_en_mef(client, cui_clean, debug_log)
 
-        registro_bridge = None
-        if not registro_ckan:
-            registro_bridge = await verificar_cui_fuentes_abiertas(client, cui_clean, debug_log)
-
-        datos_finales = registro_ckan or registro_bridge
-
-        if not datos_finales:
+        if not registro:
             raise HTTPException(
                 status_code=404,
                 detail={
-                    "mensaje": f"El CUI {cui_clean} no se encontró en el recurso primario.",
+                    "mensaje": f"El CUI {cui_clean} no se encontró.",
                     "diagnostico_ingenieria": debug_log,
-                    "sugerencia": "Abre /api/v1/esquema-mef para ver las columnas exactas del dataset."
+                    "accion_requerida": "Revisa /api/v1/esquema-mef para ver respuesta_cruda_exacta_del_mef"
                 }
             )
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
-            "fuente": "CKAN_DATOS_ABIERTOS_MEF" if registro_ckan else "BRIDGE_INVIERTE_PE",
-            "datos_proyecto": datos_finales,
+            "fuente": "API_DATOS_ABIERTOS_MEF",
+            "datos_proyecto": registro,
             "enlaces_ecosistema": {
                 "ssi_mef": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui_clean}",
                 "ficha_invierte": f"https://ofi5.mef.gob.pe/invierte/ejecucion/verFichaEjecucion/{cui_clean}",

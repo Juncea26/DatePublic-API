@@ -7,8 +7,8 @@ from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana (SSI-MEF + Catálogo Completo /Rest de Datos Abiertos MEF)",
-    version="4.8.6"
+    description="API de Veeduría Ciudadana (SSI-MEF + Extractor de los 9 Datasets de Inversión y 5 de Abastecimiento)",
+    version="4.8.7"
 )
 
 app.add_middleware(
@@ -126,14 +126,10 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: CONSULTA AL CATÁLOGO REAL https://datosabiertos.mef.gob.pe/Rest
+# MÓDULO 2: EXTRACTOR DE TODOS LOS RESOURCE_ID DE INVERSIÓN PÚBLICA Y ABASTECIMIENTO
 # =========================================================
 @app.get("/api/v1/probar-fuentes-peruanas/{cui}")
-async def listar_todos_los_datasets_mef_rest(cui: str):
-    """
-    Consulta directamente https://datosabiertos.mef.gob.pe/Rest para obtener
-    todas las categorías, datasets y resource_id (Inversión Pública, Abastecimiento/SEACE, etc.).
-    """
+async def obtener_resource_ids_inversion_y_seace(cui: str):
     token_uuid = str(uuid.uuid4())
     headers_rest = {
         **HEADERS,
@@ -143,28 +139,68 @@ async def listar_todos_los_datasets_mef_rest(cui: str):
         "Referer": "https://datosabiertos.mef.gob.pe/"
     }
 
-    async with httpx.AsyncClient(headers=headers_rest, verify=False, follow_redirects=True, timeout=15.0) as client:
-        r_categorias, r_datasets_inv, r_datasets_abast, r_all_datasets = await asyncio.gather(
-            client.post(f"{MEF_REST_BASE}/PortalWebCategorias/v1.0/getCategorias", json={}),
-            client.post(f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos", json={"category": "inversion-publica", "page": 1}),
-            client.post(f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos", json={"category": "abastecimiento-del-sector-publico", "page": 1}),
-            client.post(f"{MEF_REST_BASE}/PortalWebDatasets/v1.0/getDatasets", json={"page": 1}),
+    async with httpx.AsyncClient(headers=headers_rest, verify=False, follow_redirects=True, timeout=20.0) as client:
+        # 1. Primero extraer el código exacto de getRecursos en main-HSI2723K.js para ver los nombres de las propiedades JSON
+        r_js = await client.get("https://datosabiertos.mef.gob.pe/main-HSI2723K.js")
+        import re
+        fragmentos_get_recursos = []
+        if r_js.status_code == 200:
+            fragmentos_get_recursos = re.findall(r'.{0,220}getRecursos.{0,180}', r_js.text)
+
+        # 2. Probar el payload completo que construye Angular para getRecursos
+        payload_inv = {
+            "category": "inversion-publica",
+            "page": 1,
+            "tags": [""],
+            "formats": [""],
+            "search": "",
+            "order": "asc"
+        }
+        payload_abast = {
+            "category": "abastecimiento-del-sector-publico",
+            "page": 1,
+            "tags": [""],
+            "formats": [""],
+            "search": "",
+            "order": "asc"
+        }
+
+        r_inv, r_abast = await asyncio.gather(
+            client.post(f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos", json=payload_inv),
+            client.post(f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos", json=payload_abast),
             return_exceptions=True
         )
 
-        def parse_resp(r):
-            if isinstance(r, Exception):
-                return {"error": str(r)}
-            try:
-                return {"status": r.status_code, "json": r.json()}
-            except Exception:
-                return {"status": r.status_code, "text": r.text[:600]}
+        datasets_inv = r_inv.json() if isinstance(r_inv, httpx.Response) else {"error": str(r_inv)}
+        datasets_abast = r_abast.json() if isinstance(r_abast, httpx.Response) else {"error": str(r_abast)}
+
+        # 3. Si devolvió la lista de datasets, consultar getDatasetDetalle para cada uno y sacar sus resource_id
+        detalles_datasets = {}
+        lista_combinada = []
+        if isinstance(datasets_inv, dict) and isinstance(datasets_inv.get("datasets"), list):
+            lista_combinada.extend(datasets_inv["datasets"])
+        if isinstance(datasets_abast, dict) and isinstance(datasets_abast.get("datasets"), list):
+            lista_combinada.extend(datasets_abast["datasets"])
+
+        if lista_combinada:
+            tareas_det = [
+                client.post(
+                    f"{MEF_REST_BASE}/PortalWebDatasetDetalle/v1.0/getDatasetDetalle",
+                    json={"dataset": d.get("dataset_id")}
+                )
+                for d in lista_combinada if d.get("dataset_id")
+            ]
+            resps_det = await asyncio.gather(*tareas_det, return_exceptions=True)
+            for d, r_det in zip(lista_combinada, resps_det):
+                ds_id = d.get("dataset_id")
+                if isinstance(r_det, httpx.Response) and r_det.status_code == 200:
+                    detalles_datasets[ds_id] = r_det.json()
 
         return {
-            "1_categorias_mef": parse_resp(r_categorias),
-            "2_datasets_inversion_publica": parse_resp(r_datasets_inv),
-            "3_datasets_abastecimiento_seace": parse_resp(r_datasets_abast),
-            "4_todos_los_datasets_pagina_1": parse_resp(r_all_datasets)
+            "1_firma_exacta_js_getRecursos": fragmentos_get_recursos,
+            "2_datasets_inversion_publica": datasets_inv,
+            "3_datasets_abastecimiento": datasets_abast,
+            "4_resource_ids_por_dataset": detalles_datasets
         }
 
 
@@ -262,7 +298,7 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.8.6 - Catálogo Completo MEF /Rest",
+        "servicio": "DatePublic API v4.8.7 - Extractor de los 14 Datasets MEF",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",

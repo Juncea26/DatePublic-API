@@ -6,8 +6,8 @@ from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor de Ingeniería CUI Perú",
-    description="API de Veeduría Ciudadana con Resumen Ejecutivo de los 5 Datos Clave del SSI-MEF",
-    version="4.1.0"
+    description="API de Veeduría Ciudadana con Resumen Ejecutivo de los 5 Datos Clave del SSI-MEF y SEACE",
+    version="4.2.0"
 )
 
 app.add_middleware(
@@ -31,7 +31,7 @@ HEADERS = {
 
 
 # =========================================================
-# FUNCIONES DE FORMATO Y EXTRACCIÓN DE LOS 5 DATOS CLAVE SSI
+# FUNCIONES DE FORMATO Y UTILIDADES
 # =========================================================
 def a_float(valor: Any) -> float:
     try:
@@ -56,11 +56,10 @@ def formatear_fecha_corta(fecha_str: Any) -> str:
     return limpia
 
 
+# =========================================================
+# MÓDULO 1: SSI - MEF (5 DATOS CLAVE)
+# =========================================================
 async def consultar_ssi_directo(client: httpx.AsyncClient, cui: str) -> Optional[Dict[str, Any]]:
-    """
-    Intenta extraer datos adicionales en vivo desde ofi5.mef.gob.pe/ssi/
-    Si el firewall del MEF bloquea la IP de EE.UU. (Render), retorna None sin romper la API.
-    """
     url_ssi = "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeDetInvSSI"
     headers_ssi = {
         **HEADERS,
@@ -82,13 +81,8 @@ async def consultar_ssi_directo(client: httpx.AsyncClient, cui: str) -> Optional
 
 
 def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Construye el resumen ejecutivo con la Obra y los 5 datos más importantes de ofi5.mef.gob.pe/ssi/
-    calculando exactamente los totales (a+b+c+d) de la ficha oficial del SSI.
-    """
     fuente = {**reg, **(ssi_extra or {})}
 
-    # Cálculos exactos de la Sección III del SSI (a + b + c + d)
     costo_actualizado_a = a_float(fuente.get("COSTO_ACTUALIZADO"))
     control_concurrente_b = a_float(fuente.get("CTRL_CONCURR"))
     controversias_c = a_float(fuente.get("MONTO_LAUDO"))
@@ -104,7 +98,6 @@ def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: 
 
     avance_fisico = a_float(fuente.get("AVANCE_FISICO"))
     avance_financiero = a_float(fuente.get("AVANCE_EJECUCION"))
-
     beneficiarios_num = int(a_float(fuente.get("NUM_HABITANTES_BENEF")))
 
     return {
@@ -163,7 +156,105 @@ def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: 
 
 
 # =========================================================
-# 1. EXTRACTOR UNIVERSAL DE FILAS Y COLUMNAS DEL MEF (INTACTO)
+# MÓDULO 2: SEACE - CONTRATACIONES (5 DATOS CLAVE)
+# =========================================================
+async def consultar_seace_por_cui(
+    client: httpx.AsyncClient,
+    cui: str,
+    reg_mef: Dict[str, Any]
+) -> Dict[str, Any]:
+    procesos_detectados = []
+
+    endpoints_seace_ssi = [
+        "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeListaSeaceSSI",
+        "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeContratosSeaceSSI"
+    ]
+    headers_ssi = {
+        **HEADERS,
+        "Origin": "https://ofi5.mef.gob.pe",
+        "Referer": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+
+    for ep in endpoints_seace_ssi:
+        try:
+            resp = await client.post(ep, data={"id": cui, "tipo": "CUI"}, headers=headers_ssi, timeout=4.5)
+            if resp.status_code == 200 and resp.text.strip():
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    procesos_detectados.extend(data)
+        except Exception:
+            pass
+
+    modalidad = str(reg_mef.get("DES_MODALIDAD", "No especificada"))
+    monto_expediente_f8 = a_float(reg_mef.get("MONTO_ET_F8"))
+    costo_actualizado = a_float(reg_mef.get("COSTO_ACTUALIZADO"))
+    monto_laudo = a_float(reg_mef.get("MONTO_LAUDO"))
+    monto_fianza = a_float(reg_mef.get("MONTO_FIANZA"))
+    tiene_f8 = str(reg_mef.get("TIENE_F8", "NO"))
+
+    # Extraer años probables de convocatoria según las fechas del proyecto
+    anios_sugeridos = set()
+    for campo_fecha in ["FECHA_REGISTRO", "FECHA_VIABILIDAD", "FEC_INI_EJECUCION", "FEC_INI_EJEC_FISICA"]:
+        val = str(reg_mef.get(campo_fecha, "")).strip()
+        if len(val) >= 4 and val[:4].isdigit():
+            anios_sugeridos.add(val[:4])
+    lista_anios = sorted(list(anios_sugeridos)) if anios_sugeridos else ["2024", "2025", "2026"]
+
+    return {
+        "cui": cui,
+        "obra": reg_mef.get("NOMBRE_INVERSION", "Nombre no registrado"),
+        "portal_seace": "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml",
+        "guia_busqueda_seace": {
+            "paso_1": "Entrar a pestaña 'Buscador de Procedimientos de Selección'",
+            "paso_2": "Dejar 'Nombre o Sigla de Entidad' en blanco y abrir 'Búsqueda Avanzada'",
+            "paso_3": f"Colocar en 'Código Único de Inversión': {cui}",
+            "anios_convocatoria_recomendados": lista_anios
+        },
+        "los_5_datos_mas_importantes_seace": {
+            "1_modalidad_y_objeto_contratacion": {
+                "entidad_contratante": reg_mef.get("ENTIDAD", "No especificada"),
+                "unidad_ejecutora": reg_mef.get("NOMBRE_UEI", "No especificada"),
+                "modalidad_ejecucion_registrada": modalidad,
+                "requiere_licitacion_seace": (
+                    "SI (Por Contrata / Administración Indirecta)"
+                    if ("CONTRATA" in modalidad.upper() or "INDIRECTA" in modalidad.upper())
+                    else "EJECUCIÓN DIRECTA / MIXTA"
+                )
+            },
+            "2_presupuesto_base_y_expediente_f8": {
+                "monto_expediente_tecnico_f8": formatear_soles(monto_expediente_f8),
+                "costo_inversion_actualizado": formatear_soles(costo_actualizado),
+                "tiene_formato_8_ejecucion": tiene_f8,
+                "etapa_actual_f8": reg_mef.get("ETAPA_F8", "No especificada")
+            },
+            "3_procedimientos_y_contratos_vinculados": {
+                "total_procesos_recuperados_en_linea": len(procesos_detectados),
+                "anios_actividad_contractual": lista_anios,
+                "listado_procesos_seace": (
+                    procesos_detectados[:10]
+                    if procesos_detectados
+                    else f"Ver contratos en SEACE buscando el CUI {cui} en los años {', '.join(lista_anios)}"
+                )
+            },
+            "4_garantias_y_cartas_fianza": {
+                "monto_carta_fianza_vigente": formatear_soles(monto_fianza),
+                "tiene_carta_fianza_registrada": "SI" if monto_fianza > 0 else "NO"
+            },
+            "5_controversias_y_laudos_arbitrales": {
+                "monto_en_controversia_o_laudo": formatear_soles(monto_laudo),
+                "estado_controversias": (
+                    "ALERTA: CON LAUDO / CONTROVERSIA REGISTRADA"
+                    if monto_laudo > 0
+                    else "SIN CONTROVERSIAS NI LAUDOS REGISTRADOS"
+                )
+            }
+        }
+    }
+
+
+# =========================================================
+# MÓDULO 3: MOTOR DE BÚSQUEDA CKAN MEF (INTACTO)
 # =========================================================
 def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
     if isinstance(raw_json, list):
@@ -217,9 +308,6 @@ def fila_contiene_cui(row: Dict[str, Any], cui: str) -> bool:
     return False
 
 
-# =========================================================
-# 2. MOTOR DE BÚSQUEDA ADAPTATIVO SOBRE EL MEF (INTACTO)
-# =========================================================
 async def buscar_cui_en_mef(
     client: httpx.AsyncClient,
     cui: str,
@@ -289,15 +377,16 @@ async def buscar_cui_en_mef(
 
 
 # =========================================================
-# 3. ENDPOINTS DE DIAGNÓSTICO Y PRODUCCIÓN
+# ENDPOINTS DE LA API
 # =========================================================
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.1 - Con Resumen 5 Datos Clave SSI",
+        "servicio": "DatePublic API v4.2 - SSI + SEACE Integrados",
         "endpoints": {
             "consultar_cui_completo": "/api/v1/obra/{cui}",
             "solo_5_datos_importantes_ssi": "/api/v1/obra/{cui}/resumen-ssi",
+            "solo_5_datos_importantes_seace": "/api/v1/obra/{cui}/resumen-seace",
             "ver_json_crudo_mef": "/api/v1/esquema-mef"
         }
     }
@@ -343,7 +432,6 @@ async def consultar_obra_cui(cui: str):
 
     debug_log: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        # Consulta en paralelo el datastore MEF y el SSI directo sin bloquear si el SSI da timeout
         registro, ssi_directo = await asyncio.gather(
             buscar_cui_en_mef(client, cui_clean, debug_log),
             consultar_ssi_directo(client, cui_clean)
@@ -358,13 +446,16 @@ async def consultar_obra_cui(cui: str):
                 }
             )
 
-        resumen_5_datos = construir_5_datos_importantes_ssi(cui_clean, registro or {}, ssi_directo)
+        base_reg = registro or {}
+        resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, base_reg, ssi_directo)
+        resumen_seace = await consultar_seace_por_cui(client, cui_clean, base_reg)
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
-            "fuente": "API_DATOS_ABIERTOS_MEF + SSI_INVIERTE_PE",
-            "resumen_ssi_5_datos_clave": resumen_5_datos,
+            "fuente": "API_DATOS_ABIERTOS_MEF + SSI + SEACE",
+            "resumen_ssi_5_datos_clave": resumen_ssi,
+            "resumen_seace_5_datos_clave": resumen_seace,
             "datos_proyecto": registro,
             "enlaces_ecosistema": {
                 "ssi_mef": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui_clean}",
@@ -386,8 +477,11 @@ async def consultar_obra_cui(cui: str):
 
 @app.get("/api/v1/obra/{cui}/resumen-ssi")
 async def obtener_solo_5_datos_ssi(cui: str):
-    """
-    Endpoint ligero que devuelve únicamente el nombre de la obra y los 5 datos más importantes del SSI.
-    """
     data_completa = await consultar_obra_cui(cui)
     return data_completa["resumen_ssi_5_datos_clave"]
+
+
+@app.get("/api/v1/obra/{cui}/resumen-seace")
+async def obtener_solo_5_datos_seace(cui: str):
+    data_completa = await consultar_obra_cui(cui)
+    return data_completa["resumen_seace_5_datos_clave"]

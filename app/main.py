@@ -6,8 +6,8 @@ from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor de Ingeniería CUI Perú",
-    description="Parser adaptativo para la estructura real de api.datosabiertos.mef.gob.pe",
-    version="4.0.0"
+    description="API de Veeduría Ciudadana con Resumen Ejecutivo de los 5 Datos Clave del SSI-MEF",
+    version="4.1.0"
 )
 
 app.add_middleware(
@@ -31,27 +31,149 @@ HEADERS = {
 
 
 # =========================================================
-# 1. EXTRACTOR UNIVERSAL DE FILAS Y COLUMNAS DEL MEF
+# FUNCIONES DE FORMATO Y EXTRACCIÓN DE LOS 5 DATOS CLAVE SSI
+# =========================================================
+def a_float(valor: Any) -> float:
+    try:
+        if valor is None or str(valor).strip() == "":
+            return 0.0
+        return float(str(valor).replace(",", "").strip())
+    except Exception:
+        return 0.0
+
+
+def formatear_soles(monto: float) -> str:
+    return f"S/ {monto:,.2f}"
+
+
+def formatear_fecha_corta(fecha_str: Any) -> str:
+    if not fecha_str:
+        return "No registrado"
+    limpia = str(fecha_str).strip().split(" ")[0]
+    partes = limpia.split("-")
+    if len(partes) == 3:
+        return f"{partes[2]}/{partes[1]}/{partes[0]}"
+    return limpia
+
+
+async def consultar_ssi_directo(client: httpx.AsyncClient, cui: str) -> Optional[Dict[str, Any]]:
+    """
+    Intenta extraer datos adicionales en vivo desde ofi5.mef.gob.pe/ssi/
+    Si el firewall del MEF bloquea la IP de EE.UU. (Render), retorna None sin romper la API.
+    """
+    url_ssi = "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeDetInvSSI"
+    headers_ssi = {
+        **HEADERS,
+        "Origin": "https://ofi5.mef.gob.pe",
+        "Referer": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+    try:
+        resp = await client.post(url_ssi, data={"id": cui, "tipo": "CUI"}, headers=headers_ssi, timeout=4.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]
+            if isinstance(data, dict) and data:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Construye el resumen ejecutivo con la Obra y los 5 datos más importantes de ofi5.mef.gob.pe/ssi/
+    calculando exactamente los totales (a+b+c+d) de la ficha oficial del SSI.
+    """
+    fuente = {**reg, **(ssi_extra or {})}
+
+    # Cálculos exactos de la Sección III del SSI (a + b + c + d)
+    costo_actualizado_a = a_float(fuente.get("COSTO_ACTUALIZADO"))
+    control_concurrente_b = a_float(fuente.get("CTRL_CONCURR"))
+    controversias_c = a_float(fuente.get("MONTO_LAUDO"))
+    carta_fianza_d = a_float(fuente.get("MONTO_FIANZA"))
+    costo_total_ssi = costo_actualizado_a + control_concurrente_b + controversias_c + carta_fianza_d
+
+    costo_viable = a_float(fuente.get("MONTO_VIABLE"))
+    dev_acum_anterior = a_float(fuente.get("DEVEN_ACUMUL_ANIO_ANT"))
+    dev_anio_actual = a_float(fuente.get("DEV_ANIO_ACTUAL"))
+    devengado_total_acumulado = dev_acum_anterior + dev_anio_actual
+    pim_actual = a_float(fuente.get("PIM_ANIO_ACTUAL"))
+    saldo_por_ejecutar = a_float(fuente.get("SALDO_EJECUTAR"))
+
+    avance_fisico = a_float(fuente.get("AVANCE_FISICO"))
+    avance_financiero = a_float(fuente.get("AVANCE_EJECUCION"))
+
+    beneficiarios_num = int(a_float(fuente.get("NUM_HABITANTES_BENEF")))
+
+    return {
+        "cui": cui,
+        "portal_referencia": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
+        "obra": fuente.get("NOMBRE_INVERSION", "Nombre no registrado"),
+        "ubicacion": f"{fuente.get('DISTRITO', '')} - {fuente.get('PROVINCIA', '')} - {fuente.get('DEPARTAMENTO', '')}".strip(" -"),
+        "los_5_datos_mas_importantes": {
+            "1_institucionalidad_y_ejecutor": {
+                "entidad": fuente.get("ENTIDAD", "No especificada"),
+                "unidad_ejecutora_uei": fuente.get("NOMBRE_UEI", "No especificada"),
+                "unidad_formuladora_uf": fuente.get("NOMBRE_UF", "No especificada"),
+                "opmi": fuente.get("NOMBRE_OPMI", "No especificada"),
+                "modalidad_ejecucion": fuente.get("DES_MODALIDAD", "No especificada")
+            },
+            "2_estado_y_fase_actual": {
+                "estado_inversion": fuente.get("ESTADO", "No especificado"),
+                "situacion_formulacion": fuente.get("SITUACION", "No especificado"),
+                "etapa_ejecucion": fuente.get("ETAPA_F8", "No especificada"),
+                "tiene_expediente_tecnico": fuente.get("EXPEDIENTE_TECNICO", "NO"),
+                "tiene_informe_cierre": fuente.get("INFORME_CIERRE", "NO")
+            },
+            "3_costos_oficiales_ssi": {
+                "costo_viable_aprobado": formatear_soles(costo_viable),
+                "costo_inversion_actualizado_a": formatear_soles(costo_actualizado_a),
+                "costo_control_concurrente_b": formatear_soles(control_concurrente_b),
+                "costo_total_inversion_actualizado_ssi": formatear_soles(costo_total_ssi),
+                "valores_numericos": {
+                    "costo_viable": costo_viable,
+                    "costo_actualizado_a": costo_actualizado_a,
+                    "control_concurrente_b": control_concurrente_b,
+                    "costo_total_ssi_abcd": round(costo_total_ssi, 2)
+                }
+            },
+            "4_avance_fisico_y_financiero": {
+                "avance_fisico_porcentaje": f"{avance_fisico:.2f}%",
+                "avance_ejecucion_financiera_porcentaje": f"{avance_financiero:.2f}%",
+                "devengado_acumulado_total": formatear_soles(devengado_total_acumulado),
+                "devengado_anio_actual": formatear_soles(dev_anio_actual),
+                "pim_anio_actual": formatear_soles(pim_actual),
+                "saldo_por_ejecutar": formatear_soles(saldo_por_ejecutar)
+            },
+            "5_plazos_y_beneficiarios": {
+                "fecha_registro": formatear_fecha_corta(fuente.get("FECHA_REGISTRO")),
+                "fecha_viabilidad": formatear_fecha_corta(fuente.get("FECHA_VIABILIDAD")),
+                "fecha_inicio_ejecucion": formatear_fecha_corta(fuente.get("FEC_INI_EJECUCION")),
+                "fecha_fin_ejecucion": formatear_fecha_corta(fuente.get("FEC_FIN_EJECUCION")),
+                "beneficiarios_habitantes": f"{beneficiarios_num:,} habitantes",
+                "coordenadas": {
+                    "latitud": fuente.get("LATITUD"),
+                    "longitud": fuente.get("LONGITUD")
+                }
+            }
+        }
+    }
+
+
+# =========================================================
+# 1. EXTRACTOR UNIVERSAL DE FILAS Y COLUMNAS DEL MEF (INTACTO)
 # =========================================================
 def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
-    """
-    Sin importar cómo envuelva el API Gateway del MEF el JSON:
-    - Lista directa: [ {...}, {...} ]
-    - Raíz directa: { "records": [...], "total": ... }
-    - Estándar CKAN: { "result": { "records": [...] } }
-    - Envoltorio data/items: { "data": [...] }
-    Extrae y devuelve siempre la lista de diccionarios (filas).
-    """
     if isinstance(raw_json, list):
         return [r for r in raw_json if isinstance(r, dict)]
 
     if isinstance(raw_json, dict):
-        # Caso 1: "records" o "data" directo en la raíz
         for key in ["records", "data", "items", "rows", "registros"]:
             if isinstance(raw_json.get(key), list):
                 return raw_json[key]
 
-        # Caso 2: Dentro de "result" o "response"
         for parent in ["result", "response", "body", "payload"]:
             sub = raw_json.get(parent)
             if isinstance(sub, list):
@@ -61,7 +183,6 @@ def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[s
                     if isinstance(sub.get(key), list):
                         return sub[key]
 
-        # Caso 3: Buscar cualquier lista de diccionarios en el primer nivel
         for val in raw_json.values():
             if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
                 return val
@@ -78,7 +199,6 @@ def descubrir_columnas_cui_desde_filas(records: List[Dict[str, Any]]) -> List[st
     keywords = ["UNICO", "CUI", "CODIGO", "INVERSION", "PROYECTO", "SNIP", "COD"]
     prioritarias = [col for col in todas_las_columnas if any(k in col.upper() for k in keywords)]
 
-    # También detectar columnas cuyos valores sean números de 6 a 8 dígitos (como 2641470)
     for col, val in primera_fila.items():
         val_str = str(val).strip().split(".")[0]
         if val_str.isdigit() and 6 <= len(val_str) <= 8 and col not in prioritarias and col != "_id":
@@ -98,7 +218,7 @@ def fila_contiene_cui(row: Dict[str, Any], cui: str) -> bool:
 
 
 # =========================================================
-# 2. MOTOR DE BÚSQUEDA ADAPTATIVO SOBRE EL MEF
+# 2. MOTOR DE BÚSQUEDA ADAPTATIVO SOBRE EL MEF (INTACTO)
 # =========================================================
 async def buscar_cui_en_mef(
     client: httpx.AsyncClient,
@@ -107,7 +227,6 @@ async def buscar_cui_en_mef(
 ) -> Optional[Dict[str, Any]]:
     global DETECTED_COLUMNS_CACHE
 
-    # Paso 1: Si aún no conocemos las columnas reales del MEF, traemos 1 fila real
     if not DETECTED_COLUMNS_CACHE:
         try:
             r_sample = await client.get(
@@ -128,15 +247,12 @@ async def buscar_cui_en_mef(
 
     debug_log["columnas_cui_usadas"] = DETECTED_COLUMNS_CACHE
 
-    # Paso 2: Lanzar consultas en paralelo con ?q= y con ?filters= sobre las columnas reales descubiertas
     consultas = [
-        # Búsqueda con q= texto entero y decimal
         client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "q": cui, "limit": 15}, timeout=15.0),
         client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "q": f"{cui}.0", "limit": 15}, timeout=15.0),
     ]
 
     for col in DETECTED_COLUMNS_CACHE[:4]:
-        # Probar filtro como string y como número entero
         consultas.append(
             client.get(
                 CKAN_SEARCH,
@@ -164,7 +280,6 @@ async def buscar_cui_en_mef(
                         if fila_contiene_cui(row, cui):
                             debug_log["estrategia_ganadora_idx"] = idx
                             return row
-                    # Si un filtro exacto devolvió una fila, retornarla
                     if idx >= 2 and len(records) == 1:
                         return records[0]
             except Exception:
@@ -179,20 +294,17 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.0",
+        "servicio": "DatePublic API v4.1 - Con Resumen 5 Datos Clave SSI",
         "endpoints": {
-            "ver_json_crudo_mef": "/api/v1/esquema-mef",
-            "consultar_cui": "/api/v1/obra/{cui}"
+            "consultar_cui_completo": "/api/v1/obra/{cui}",
+            "solo_5_datos_importantes_ssi": "/api/v1/obra/{cui}/resumen-ssi",
+            "ver_json_crudo_mef": "/api/v1/esquema-mef"
         }
     }
 
 
 @app.get("/api/v1/esquema-mef")
 async def ver_json_crudo_real_del_mef():
-    """
-    Devuelve el JSON EXACTO sin recortar que entrega api.datosabiertos.mef.gob.pe
-    para ver las llaves reales, nombres de columnas y 2 filas de ejemplo.
-    """
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
         resp = await client.get(
             CKAN_SEARCH,
@@ -231,22 +343,28 @@ async def consultar_obra_cui(cui: str):
 
     debug_log: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        registro = await buscar_cui_en_mef(client, cui_clean, debug_log)
+        # Consulta en paralelo el datastore MEF y el SSI directo sin bloquear si el SSI da timeout
+        registro, ssi_directo = await asyncio.gather(
+            buscar_cui_en_mef(client, cui_clean, debug_log),
+            consultar_ssi_directo(client, cui_clean)
+        )
 
-        if not registro:
+        if not registro and not ssi_directo:
             raise HTTPException(
                 status_code=404,
                 detail={
                     "mensaje": f"El CUI {cui_clean} no se encontró.",
-                    "diagnostico_ingenieria": debug_log,
-                    "accion_requerida": "Revisa /api/v1/esquema-mef para ver respuesta_cruda_exacta_del_mef"
+                    "diagnostico_ingenieria": debug_log
                 }
             )
+
+        resumen_5_datos = construir_5_datos_importantes_ssi(cui_clean, registro or {}, ssi_directo)
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
-            "fuente": "API_DATOS_ABIERTOS_MEF",
+            "fuente": "API_DATOS_ABIERTOS_MEF + SSI_INVIERTE_PE",
+            "resumen_ssi_5_datos_clave": resumen_5_datos,
             "datos_proyecto": registro,
             "enlaces_ecosistema": {
                 "ssi_mef": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui_clean}",
@@ -264,3 +382,12 @@ async def consultar_obra_cui(cui: str):
 
         CUI_MEMORY_CACHE[cui_clean] = respuesta
         return respuesta
+
+
+@app.get("/api/v1/obra/{cui}/resumen-ssi")
+async def obtener_solo_5_datos_ssi(cui: str):
+    """
+    Endpoint ligero que devuelve únicamente el nombre de la obra y los 5 datos más importantes del SSI.
+    """
+    data_completa = await consultar_obra_cui(cui)
+    return data_completa["resumen_ssi_5_datos_clave"]

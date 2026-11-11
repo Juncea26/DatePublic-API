@@ -3,12 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
 import re
+from bs4 import BeautifulSoup
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana (SSI-MEF + Inspector de Microservicios Abiertos OSCE/MEF)",
-    version="4.8.0"
+    description="API de Veeduría Ciudadana (SSI-MEF + Extractor Profundo de Rutas API OSCE/MEF)",
+    version="4.8.1"
 )
 
 app.add_middleware(
@@ -125,80 +126,71 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: INSPECTOR DE MICROSERVICIOS DE APPS.OSCE.GOB.PE Y MEF
+# MÓDULO 2: EXTRACTOR PROFUNDO DE VARIABLES API EN BUNDLES JS Y PORTAL MEF
 # =========================================================
-async def extraer_endpoints_de_angular(client: httpx.AsyncClient, base_url: str) -> Dict[str, Any]:
-    """
-    Lee el index.html de una app Angular del Estado (como Cuaderno de Obra o FUP),
-    descarga su main.js y extrae todas las URLs de APIs REST internas que utiliza.
-    """
-    info: Dict[str, Any] = {"base_url": base_url}
+async def inspeccionar_js_profundo(client: httpx.AsyncClient, js_url: str) -> Dict[str, Any]:
+    res: Dict[str, Any] = {"js_url": js_url}
     try:
-        r_html = await client.get(base_url, timeout=8.0)
-        info["html_status"] = r_html.status_code
-        if r_html.status_code == 200:
-            scripts = re.findall(r'src=["\']([^"\']*main[^"\']*\.js)["\']', r_html.text)
-            info["scripts_main"] = scripts
-            if scripts:
-                js_path = scripts[0]
-                if not js_path.startswith("http"):
-                    raiz = base_url.rstrip("/")
-                    js_url = f"{raiz}/{js_path.lstrip('/')}"
-                else:
-                    js_url = js_path
+        r = await client.get(js_url, timeout=12.0)
+        res["status"] = r.status_code
+        res["size_bytes"] = len(r.text)
+        if r.status_code == 200:
+            txt = r.text
+            # 1. Buscar cualquier llamada .get(...) o .post(...) en el servicio Angular
+            llamadas_http = list(set(re.findall(r'\.(?:get|post)\s*(?:<[^>]+>)?\s*\(([^)]{3,120})\)', txt)))
+            # 2. Buscar asignaciones de variables con palabras clave de URL/API/Backend
+            variables_api = list(set(re.findall(r'[a-zA-Z0-9_]*(?:Url|URL|Api|API|Endpoint|Host|Server|Base|Context|Service|Path)[a-zA-Z0-9_]*\s*:\s*["\']([^"\']+)["\']', txt)))
+            # 3. Buscar todos los strings entre comillas que tengan barras '/' y parezcan endpoints REST
+            strings_con_barra = list(set(re.findall(r'["\']([a-zA-Z0-9_\-\.]{2,40}/[a-zA-Z0-9_\-\./\?=&]{2,80})["\']', txt)))
+            strings_filtrados = [
+                s for s in strings_con_barra
+                if not any(ign in s.lower() for ign in ["assets/", "node_modules", "material", "angular", "svg", "image/", "text/", "application/", "xliff"])
+            ]
 
-                r_js = await client.get(js_url, timeout=10.0)
-                info["js_status"] = r_js.status_code
-                if r_js.status_code == 200:
-                    # Buscar URLs http/https y rutas de API dentro del bundle compilado de Angular
-                    urls_http = list(set(re.findall(r'https?://[a-zA-Z0-9\.\-_/\?:=&]+', r_js.text)))
-                    urls_osce = [u for u in urls_http if any(k in u.lower() for k in ["osce", "oece", "seace", "mef", "gob.pe", "api"])]
-                    rutas_api = list(set(re.findall(r'["\'](/[a-zA-Z0-9\-_]+/[a-zA-Z0-9\-_/]+)["\']', r_js.text)))
-                    rutas_filtradas = [
-                        r for r in rutas_api
-                        if any(k in r.lower() for k in ["api", "buscador", "cuaderno", "obra", "proveedor", "fup", "seace", "contrato", "inversion", "search", "consulta"])
-                    ]
-                    info["urls_gob_encontradas"] = urls_osce[:30]
-                    info["rutas_api_internas"] = rutas_filtradas[:40]
+            res["variables_config_api"] = variables_api[:40]
+            res["llamadas_http_get_post"] = llamadas_http[:40]
+            res["rutas_rest_detectadas"] = strings_filtrados[:50]
     except Exception as e:
-        info["error"] = f"{type(e).__name__}: {str(e)}"
+        res["error"] = str(e)
+    return res
+
+
+async def explorar_portal_mef_profundo(client: httpx.AsyncClient) -> Dict[str, Any]:
+    info: Dict[str, Any] = {}
+    try:
+        r = await client.get("https://datosabiertos.mef.gob.pe/", timeout=10.0)
+        info["home_status"] = r.status_code
+        soup = BeautifulSoup(r.text, "lxml")
+        enlaces = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            texto = a.get_text(" ", strip=True)
+            if href and not href.startswith("#") and not href.startswith("javascript"):
+                enlaces.append({"texto": texto[:60], "href": href})
+        info["enlaces_portada"] = enlaces[:35]
+
+        # Buscar scripts o llamadas AJAX en la portada de datosabiertos.mef.gob.pe
+        scripts_mef = [s.get("src") for s in soup.find_all("script") if s.get("src")]
+        info["scripts_mef"] = scripts_mef
+        info["muestra_html"] = r.text[:800]
+    except Exception as e:
+        info["error"] = str(e)
     return info
 
 
 @app.get("/api/v1/probar-fuentes-peruanas/{cui}")
 async def descubrir_apis_internas_abiertas(cui: str):
-    """
-    Extrae las rutas REST internas de los portales que SÍ abren desde Render (200 OK):
-    - apps.osce.gob.pe/buscador-cuaderno-obra/
-    - apps.oece.gob.pe/perfilprov-ui/
-    - Portal web datosabiertos.mef.gob.pe (para listar otros resource_id)
-    """
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=10.0) as client:
-        cuaderno_info, fup_info, portal_mef, buscador_osce = await asyncio.gather(
-            extraer_endpoints_de_angular(client, "https://apps.osce.gob.pe/buscador-cuaderno-obra/"),
-            extraer_endpoints_de_angular(client, "https://apps.oece.gob.pe/perfilprov-ui/"),
-            client.get("https://datosabiertos.mef.gob.pe/"),
-            client.get("https://prod4.seace.gob.pe/"),
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
+        cuaderno_js, fup_js, mef_web = await asyncio.gather(
+            inspeccionar_js_profundo(client, "https://apps.osce.gob.pe/buscador-cuaderno-obra/main-es2015.938f7af282f717dbf663.js"),
+            inspeccionar_js_profundo(client, "https://apps.oece.gob.pe/perfilprov-ui/main.2b917411c9b9e438549e.js"),
+            explorar_portal_mef_profundo(client),
             return_exceptions=True
         )
-
-        # Extraer UUIDs (resource_id) si el portal web de Datos Abiertos MEF abre
-        mef_portal_status = None
-        uuids_mef = []
-        if isinstance(portal_mef, httpx.Response):
-            mef_portal_status = portal_mef.status_code
-            uuids_mef = list(set(re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', portal_mef.text, re.I)))
-
-        prod4_status = buscador_osce.status_code if isinstance(buscador_osce, httpx.Response) else str(type(buscador_osce).__name__)
-
         return {
-            "1_cuaderno_obra_osce_angular": cuaderno_info,
-            "2_fup_proveedor_oece_angular": fup_info,
-            "3_portal_web_datosabiertos_mef": {
-                "status": mef_portal_status,
-                "uuids_detectados": uuids_mef
-            },
-            "4_prod4_seace_status": prod4_status
+            "1_cuaderno_obra_js_interno": cuaderno_js,
+            "2_fup_proveedor_js_interno": fup_js,
+            "3_portal_datosabiertos_mef_estructura": mef_web
         }
 
 
@@ -296,7 +288,7 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.8 - SSI Estable + Inspector Angular OSCE",
+        "servicio": "DatePublic API v4.8.1 - SSI Estable + Extractor Profundo",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",

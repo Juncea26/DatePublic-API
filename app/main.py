@@ -2,12 +2,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
+import re
+from bs4 import BeautifulSoup
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
-    title="DatePublic API - Motor de Ingeniería CUI Perú",
-    description="API de Veeduría Ciudadana con Resumen Ejecutivo de los 5 Datos Clave del SSI-MEF y SEACE",
-    version="4.2.0"
+    title="DatePublic API - Motor CUI Perú",
+    description="API de Veeduría Ciudadana: Datos 100% reales de SSI-MEF y Tabla SEACE (Sin datos de relleno)",
+    version="4.4.0"
 )
 
 app.add_middleware(
@@ -20,18 +22,20 @@ app.add_middleware(
 
 CKAN_SEARCH = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1/datastore_search"
 PRIMARY_RESOURCE_ID = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"
+SEACE_URL = "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml"
 
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
 DETECTED_COLUMNS_CACHE: List[str] = []
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "application/json"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+    "Accept-Language": "es-PE,es;q=0.9,en;q=0.8"
 }
 
 
 # =========================================================
-# FUNCIONES DE FORMATO Y UTILIDADES
+# FUNCIONES DE FORMATO
 # =========================================================
 def a_float(valor: Any) -> float:
     try:
@@ -57,32 +61,9 @@ def formatear_fecha_corta(fecha_str: Any) -> str:
 
 
 # =========================================================
-# MÓDULO 1: SSI - MEF (5 DATOS CLAVE)
+# MÓDULO 1: SSI - MEF (LOS 5 DATOS CLAVE)
 # =========================================================
-async def consultar_ssi_directo(client: httpx.AsyncClient, cui: str) -> Optional[Dict[str, Any]]:
-    url_ssi = "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeDetInvSSI"
-    headers_ssi = {
-        **HEADERS,
-        "Origin": "https://ofi5.mef.gob.pe",
-        "Referer": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
-        "X-Requested-With": "XMLHttpRequest"
-    }
-    try:
-        resp = await client.post(url_ssi, data={"id": cui, "tipo": "CUI"}, headers=headers_ssi, timeout=4.5)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
-            if isinstance(data, dict) and data:
-                return data
-    except Exception:
-        pass
-    return None
-
-
-def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    fuente = {**reg, **(ssi_extra or {})}
-
+def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[str, Any]:
     costo_actualizado_a = a_float(fuente.get("COSTO_ACTUALIZADO"))
     control_concurrente_b = a_float(fuente.get("CTRL_CONCURR"))
     controversias_c = a_float(fuente.get("MONTO_LAUDO"))
@@ -124,13 +105,7 @@ def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: 
                 "costo_viable_aprobado": formatear_soles(costo_viable),
                 "costo_inversion_actualizado_a": formatear_soles(costo_actualizado_a),
                 "costo_control_concurrente_b": formatear_soles(control_concurrente_b),
-                "costo_total_inversion_actualizado_ssi": formatear_soles(costo_total_ssi),
-                "valores_numericos": {
-                    "costo_viable": costo_viable,
-                    "costo_actualizado_a": costo_actualizado_a,
-                    "control_concurrente_b": control_concurrente_b,
-                    "costo_total_ssi_abcd": round(costo_total_ssi, 2)
-                }
+                "costo_total_inversion_actualizado_ssi": formatear_soles(costo_total_ssi)
             },
             "4_avance_fisico_y_financiero": {
                 "avance_fisico_porcentaje": f"{avance_fisico:.2f}%",
@@ -145,111 +120,195 @@ def construir_5_datos_importantes_ssi(cui: str, reg: Dict[str, Any], ssi_extra: 
                 "fecha_viabilidad": formatear_fecha_corta(fuente.get("FECHA_VIABILIDAD")),
                 "fecha_inicio_ejecucion": formatear_fecha_corta(fuente.get("FEC_INI_EJECUCION")),
                 "fecha_fin_ejecucion": formatear_fecha_corta(fuente.get("FEC_FIN_EJECUCION")),
-                "beneficiarios_habitantes": f"{beneficiarios_num:,} habitantes",
-                "coordenadas": {
-                    "latitud": fuente.get("LATITUD"),
-                    "longitud": fuente.get("LONGITUD")
-                }
+                "beneficiarios_habitantes": f"{beneficiarios_num:,} habitantes"
             }
         }
     }
 
 
 # =========================================================
-# MÓDULO 2: SEACE - CONTRATACIONES (5 DATOS CLAVE)
+# MÓDULO 2: SCRAPER REAL JSF DE SEACE (AUTODESCUBRIMIENTO DEL FORMULARIO XHTML)
 # =========================================================
-async def consultar_seace_por_cui(
-    client: httpx.AsyncClient,
-    cui: str,
-    reg_mef: Dict[str, Any]
-) -> Dict[str, Any]:
-    procesos_detectados = []
+def extraer_html_de_respuesta_jsf(raw_text: str) -> str:
+    """
+    Si PrimeFaces devuelve un XML <partial-response><changes><update>...</update>,
+    extrae el contenido interno CDATA para que BeautifulSoup lea las filas <tr> sin problemas.
+    """
+    bloques_cdata = re.findall(r"<!\[CDATA\[(.*?)\]\]>", raw_text, flags=re.DOTALL)
+    if bloques_cdata:
+        return "\n".join(bloques_cdata)
+    return raw_text
 
-    endpoints_seace_ssi = [
-        "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeListaSeaceSSI",
-        "https://ofi5.mef.gob.pe/inviertews/Dashboard/traeContratosSeaceSSI"
-    ]
-    headers_ssi = {
-        **HEADERS,
-        "Origin": "https://ofi5.mef.gob.pe",
-        "Referer": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
-        "X-Requested-With": "XMLHttpRequest"
+
+def parsear_filas_reales_seace(raw_response_text: str) -> List[Dict[str, Any]]:
+    html_limpio = extraer_html_de_respuesta_jsf(raw_response_text)
+    soup = BeautifulSoup(html_limpio, "lxml")
+    resultados = []
+
+    for tr in soup.find_all("tr"):
+        celdas = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        # En la tabla de SEACE:
+        # [0:N°, 1:Entidad, 2:Fecha, 3:Nomenclatura, 4:Reiniciado, 5:Objeto, 6:Descripción, 7:SNIP, 8:CUI, 9:VR/Cuantía, 10:Moneda, 11:Versión]
+        if len(celdas) >= 11 and celdas[0].isdigit() and "/" in celdas[2] and "-" in celdas[3]:
+            cuantia = celdas[9]
+            moneda = celdas[10]
+            resultados.append({
+                "1_entidad": celdas[1],
+                "2_fecha_publicacion": celdas[2],
+                "3_nomenclatura": celdas[3],
+                "4_objeto_contratacion": celdas[5],
+                "5_descripcion_objeto": celdas[6],
+                "6_valor_referencial_cuantia": f"S/ {cuantia}" if "Sol" in moneda else f"{cuantia} {moneda}",
+                "moneda": moneda,
+                "version_seace": celdas[11] if len(celdas) > 11 else "3"
+            })
+    return resultados
+
+
+def descubrir_estructura_formulario_seace(html_inicial: str) -> Dict[str, Any]:
+    """
+    Inspecciona el HTML real de buscadorPublico.xhtml para encontrar los nombres (name/id)
+    exactos del formulario de Procedimientos de Selección sin adivinarlos.
+    """
+    soup = BeautifulSoup(html_inicial, "lxml")
+    vs_input = soup.find("input", {"name": re.compile(r"ViewState", re.I)})
+    view_state = vs_input.get("value", "") if vs_input else ""
+
+    # Buscar todos los inputs/selects/botones relacionados con el buscador de procesos
+    campo_cui = None
+    campo_anio = None
+    boton_buscar = None
+    form_id = None
+    campos_base = {}
+
+    for form in soup.find_all("form"):
+        f_id = form.get("id") or form.get("name") or ""
+        html_form = str(form)
+        if "CodigoUnico" in html_form or "Proceso" in f_id or "anioConvocatoria" in html_form or "tbBuscador" in html_form:
+            form_id = f_id
+            for inp in form.find_all(["input", "select", "button", "a"]):
+                name_attr = inp.get("name") or inp.get("id") or ""
+                id_attr = inp.get("id") or ""
+                if not name_attr:
+                    continue
+
+                # Guardar valores por defecto de inputs ocultos o selects del formulario
+                if inp.name == "input" and inp.get("type") in ["hidden", "text"]:
+                    campos_base[name_attr] = inp.get("value", "")
+                elif inp.name == "select":
+                    opt_sel = inp.find("option", selected=True) or inp.find("option")
+                    if opt_sel and opt_sel.get("value") is not None:
+                        campos_base[name_attr] = opt_sel.get("value", "")
+
+                # Identificar campo de Código Único de Inversión
+                if any(k in name_attr.lower() for k in ["codigounico", "cui", "inversion"]):
+                    campo_cui = name_attr
+                # Identificar campo de Año de Convocatoria
+                if "anioconvocatoria" in name_attr.lower() and not name_attr.endswith("_focus"):
+                    campo_anio = name_attr
+                # Identificar botón Buscar de Procedimientos de Selección
+                texto_btn = inp.get_text(" ", strip=True).lower()
+                onclick_btn = inp.get("onclick", "")
+                if ("buscar" in name_attr.lower() or "buscar" in texto_btn) and "limpiar" not in name_attr.lower():
+                    if "proceso" in name_attr.lower() or "seltoken" in name_attr.lower() or not boton_buscar:
+                        boton_buscar = id_attr or name_attr
+
+    return {
+        "view_state": view_state,
+        "form_id": form_id or "tbBuscador:idFormBuscarProceso",
+        "campo_cui": campo_cui or "tbBuscador:idFormBuscarProceso:txtCodigoUnico",
+        "campo_anio": campo_anio or "tbBuscador:idFormBuscarProceso:anioConvocatoria_input",
+        "boton_buscar": boton_buscar or "tbBuscador:idFormBuscarProceso:btnBuscarSelToken",
+        "campos_base": campos_base
     }
 
-    for ep in endpoints_seace_ssi:
-        try:
-            resp = await client.post(ep, data={"id": cui, "tipo": "CUI"}, headers=headers_ssi, timeout=4.5)
-            if resp.status_code == 200 and resp.text.strip():
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    procesos_detectados.extend(data)
-        except Exception:
-            pass
 
-    modalidad = str(reg_mef.get("DES_MODALIDAD", "No especificada"))
-    monto_expediente_f8 = a_float(reg_mef.get("MONTO_ET_F8"))
-    costo_actualizado = a_float(reg_mef.get("COSTO_ACTUALIZADO"))
-    monto_laudo = a_float(reg_mef.get("MONTO_LAUDO"))
-    monto_fianza = a_float(reg_mef.get("MONTO_FIANZA"))
-    tiene_f8 = str(reg_mef.get("TIENE_F8", "NO"))
-
-    # Extraer años probables de convocatoria según las fechas del proyecto
-    anios_sugeridos = set()
-    for campo_fecha in ["FECHA_REGISTRO", "FECHA_VIABILIDAD", "FEC_INI_EJECUCION", "FEC_INI_EJEC_FISICA"]:
-        val = str(reg_mef.get(campo_fecha, "")).strip()
+def obtener_anios_busqueda(reg_mef: Dict[str, Any]) -> List[str]:
+    anios = []
+    for k in ["FEC_INI_EJECUCION", "FECHA_VIABILIDAD", "FECHA_REGISTRO", "FEC_INI_EJEC_FISICA"]:
+        val = str(reg_mef.get(k, "")).strip()
         if len(val) >= 4 and val[:4].isdigit():
-            anios_sugeridos.add(val[:4])
-    lista_anios = sorted(list(anios_sugeridos)) if anios_sugeridos else ["2024", "2025", "2026"]
+            y = int(val[:4])
+            for candidato in [str(y), str(y + 1), str(y + 2)]:
+                if 2015 <= int(candidato) <= 2026 and candidato not in anios:
+                    anios.append(candidato)
+    if not anios:
+        anios = ["2026", "2025", "2024", "2023", "2022", "2021", "2020"]
+    return anios[:4]
+
+
+async def extraer_tabla_seace_real(cui: str, reg_mef: Dict[str, Any], debug_seace: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if debug_seace is None:
+        debug_seace = {}
+
+    anios_a_probar = obtener_anios_busqueda(reg_mef)
+    debug_seace["anios_probados"] = anios_a_probar
+    procedimientos_encontrados: List[Dict[str, Any]] = []
+    anio_exitoso = None
+
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=18.0) as client:
+            # 1. GET inicial para obtener Cookie JSESSIONID y descubrir IDs reales del formulario
+            r_get = await client.get(SEACE_URL)
+            debug_seace["get_inicial_status"] = r_get.status_code
+
+            if r_get.status_code == 200:
+                meta = descubrir_estructura_formulario_seace(r_get.text)
+                debug_seace["formulario_detectado"] = {
+                    "form_id": meta["form_id"],
+                    "campo_cui": meta["campo_cui"],
+                    "campo_anio": meta["campo_anio"],
+                    "boton_buscar": meta["boton_buscar"],
+                    "tiene_viewstate": bool(meta["view_state"])
+                }
+
+                if meta["view_state"]:
+                    for anio in anios_a_probar:
+                        payload = dict(meta["campos_base"])
+                        payload.update({
+                            "javax.faces.partial.ajax": "true",
+                            "javax.faces.source": meta["boton_buscar"],
+                            "javax.faces.partial.execute": "@all",
+                            "javax.faces.partial.render": "@all",
+                            meta["boton_buscar"]: meta["boton_buscar"],
+                            meta["form_id"]: meta["form_id"],
+                            meta["campo_cui"]: cui,
+                            meta["campo_anio"]: anio,
+                            "javax.faces.ViewState": meta["view_state"]
+                        })
+
+                        headers_post = {
+                            **HEADERS,
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "Faces-Request": "partial/ajax",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Origin": "https://prod2.seace.gob.pe",
+                            "Referer": SEACE_URL
+                        }
+
+                        r_post = await client.post(SEACE_URL, data=payload, headers=headers_post)
+                        debug_seace[f"post_{anio}_status"] = r_post.status_code
+
+                        if r_post.status_code == 200:
+                            # Actualizar ViewState si el servidor rotó el token en la respuesta XML
+                            vs_match = re.search(r'id=".*?ViewState.*?"[^>]*>\s*<!\[CDATA\[(.*?)\]\]>', r_post.text)
+                            if vs_match:
+                                meta["view_state"] = vs_match.group(1)
+
+                            filas = parsear_filas_reales_seace(r_post.text)
+                            if filas:
+                                procedimientos_encontrados.extend(filas)
+                                anio_exitoso = anio
+                                break
+    except Exception as e:
+        debug_seace["seace_exception"] = f"{type(e).__name__}: {str(e)}"
 
     return {
         "cui": cui,
-        "obra": reg_mef.get("NOMBRE_INVERSION", "Nombre no registrado"),
-        "portal_seace": "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml",
-        "guia_busqueda_seace": {
-            "paso_1": "Entrar a pestaña 'Buscador de Procedimientos de Selección'",
-            "paso_2": "Dejar 'Nombre o Sigla de Entidad' en blanco y abrir 'Búsqueda Avanzada'",
-            "paso_3": f"Colocar en 'Código Único de Inversión': {cui}",
-            "anios_convocatoria_recomendados": lista_anios
-        },
-        "los_5_datos_mas_importantes_seace": {
-            "1_modalidad_y_objeto_contratacion": {
-                "entidad_contratante": reg_mef.get("ENTIDAD", "No especificada"),
-                "unidad_ejecutora": reg_mef.get("NOMBRE_UEI", "No especificada"),
-                "modalidad_ejecucion_registrada": modalidad,
-                "requiere_licitacion_seace": (
-                    "SI (Por Contrata / Administración Indirecta)"
-                    if ("CONTRATA" in modalidad.upper() or "INDIRECTA" in modalidad.upper())
-                    else "EJECUCIÓN DIRECTA / MIXTA"
-                )
-            },
-            "2_presupuesto_base_y_expediente_f8": {
-                "monto_expediente_tecnico_f8": formatear_soles(monto_expediente_f8),
-                "costo_inversion_actualizado": formatear_soles(costo_actualizado),
-                "tiene_formato_8_ejecucion": tiene_f8,
-                "etapa_actual_f8": reg_mef.get("ETAPA_F8", "No especificada")
-            },
-            "3_procedimientos_y_contratos_vinculados": {
-                "total_procesos_recuperados_en_linea": len(procesos_detectados),
-                "anios_actividad_contractual": lista_anios,
-                "listado_procesos_seace": (
-                    procesos_detectados[:10]
-                    if procesos_detectados
-                    else f"Ver contratos en SEACE buscando el CUI {cui} en los años {', '.join(lista_anios)}"
-                )
-            },
-            "4_garantias_y_cartas_fianza": {
-                "monto_carta_fianza_vigente": formatear_soles(monto_fianza),
-                "tiene_carta_fianza_registrada": "SI" if monto_fianza > 0 else "NO"
-            },
-            "5_controversias_y_laudos_arbitrales": {
-                "monto_en_controversia_o_laudo": formatear_soles(monto_laudo),
-                "estado_controversias": (
-                    "ALERTA: CON LAUDO / CONTROVERSIA REGISTRADA"
-                    if monto_laudo > 0
-                    else "SIN CONTROVERSIAS NI LAUDOS REGISTRADOS"
-                )
-            }
-        }
+        "portal_seace": SEACE_URL,
+        "anio_convocatoria_encontrado": anio_exitoso,
+        "total_procedimientos": len(procedimientos_encontrados),
+        "procedimientos_seace": procedimientos_encontrados
     }
 
 
@@ -259,12 +318,10 @@ async def consultar_seace_por_cui(
 def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
     if isinstance(raw_json, list):
         return [r for r in raw_json if isinstance(r, dict)]
-
     if isinstance(raw_json, dict):
         for key in ["records", "data", "items", "rows", "registros"]:
             if isinstance(raw_json.get(key), list):
                 return raw_json[key]
-
         for parent in ["result", "response", "body", "payload"]:
             sub = raw_json.get(parent)
             if isinstance(sub, list):
@@ -273,11 +330,9 @@ def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[s
                 for key in ["records", "data", "items", "rows"]:
                     if isinstance(sub.get(key), list):
                         return sub[key]
-
         for val in raw_json.values():
             if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
                 return val
-
     return []
 
 
@@ -286,15 +341,12 @@ def descubrir_columnas_cui_desde_filas(records: List[Dict[str, Any]]) -> List[st
         return []
     primera_fila = records[0]
     todas_las_columnas = list(primera_fila.keys())
-
     keywords = ["UNICO", "CUI", "CODIGO", "INVERSION", "PROYECTO", "SNIP", "COD"]
     prioritarias = [col for col in todas_las_columnas if any(k in col.upper() for k in keywords)]
-
     for col, val in primera_fila.items():
         val_str = str(val).strip().split(".")[0]
         if val_str.isdigit() and 6 <= len(val_str) <= 8 and col not in prioritarias and col != "_id":
             prioritarias.append(col)
-
     return prioritarias if prioritarias else todas_las_columnas[:5]
 
 
@@ -314,65 +366,37 @@ async def buscar_cui_en_mef(
     debug_log: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     global DETECTED_COLUMNS_CACHE
-
     if not DETECTED_COLUMNS_CACHE:
         try:
-            r_sample = await client.get(
-                CKAN_SEARCH,
-                params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 2},
-                timeout=12.0
-            )
-            debug_log["sample_http_status"] = r_sample.status_code
+            r_sample = await client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 2}, timeout=12.0)
             if r_sample.status_code == 200:
-                raw_sample = r_sample.json()
-                debug_log["llaves_raiz_json_mef"] = list(raw_sample.keys()) if isinstance(raw_sample, dict) else "LISTA_DIRECTA"
-                filas_muestra = extraer_records_de_respuesta_mef(raw_sample)
+                filas_muestra = extraer_records_de_respuesta_mef(r_sample.json())
                 if filas_muestra:
                     DETECTED_COLUMNS_CACHE = descubrir_columnas_cui_desde_filas(filas_muestra)
-                    debug_log["ejemplo_fila_1_llaves"] = list(filas_muestra[0].keys())
-        except Exception as e:
-            debug_log["sample_error"] = str(e)
-
-    debug_log["columnas_cui_usadas"] = DETECTED_COLUMNS_CACHE
+        except Exception:
+            pass
 
     consultas = [
         client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "q": cui, "limit": 15}, timeout=15.0),
         client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "q": f"{cui}.0", "limit": 15}, timeout=15.0),
     ]
-
     for col in DETECTED_COLUMNS_CACHE[:4]:
-        consultas.append(
-            client.get(
-                CKAN_SEARCH,
-                params={"resource_id": PRIMARY_RESOURCE_ID, "filters": f'{{"{col}":"{cui}"}}', "limit": 5},
-                timeout=15.0
-            )
-        )
-        consultas.append(
-            client.get(
-                CKAN_SEARCH,
-                params={"resource_id": PRIMARY_RESOURCE_ID, "filters": f'{{"{col}":{int(cui)}}}', "limit": 5},
-                timeout=15.0
-            )
-        )
+        consultas.append(client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "filters": f'{{"{col}":"{cui}"}}', "limit": 5}, timeout=15.0))
+        consultas.append(client.get(CKAN_SEARCH, params={"resource_id": PRIMARY_RESOURCE_ID, "filters": f'{{"{col}":{int(cui)}}}', "limit": 5}, timeout=15.0))
 
     respuestas = await asyncio.gather(*consultas, return_exceptions=True)
-
     for idx, resp in enumerate(respuestas):
         if isinstance(resp, httpx.Response) and resp.status_code == 200:
             try:
-                raw_data = resp.json()
-                records = extraer_records_de_respuesta_mef(raw_data)
+                records = extraer_records_de_respuesta_mef(resp.json())
                 if records:
                     for row in records:
                         if fila_contiene_cui(row, cui):
-                            debug_log["estrategia_ganadora_idx"] = idx
                             return row
                     if idx >= 2 and len(records) == 1:
                         return records[0]
             except Exception:
                 continue
-
     return None
 
 
@@ -382,38 +406,30 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.2 - SSI + SEACE Integrados",
+        "servicio": "DatePublic API v4.4 - 100% Datos Reales SEACE",
         "endpoints": {
-            "consultar_cui_completo": "/api/v1/obra/{cui}",
-            "solo_5_datos_importantes_ssi": "/api/v1/obra/{cui}/resumen-ssi",
-            "solo_5_datos_importantes_seace": "/api/v1/obra/{cui}/resumen-seace",
-            "ver_json_crudo_mef": "/api/v1/esquema-mef"
+            "obra_completa": "/api/v1/obra/{cui}",
+            "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
+            "resumen_seace": "/api/v1/obra/{cui}/resumen-seace",
+            "debug_seace": "/api/v1/debug-seace/{cui}"
         }
     }
 
 
-@app.get("/api/v1/esquema-mef")
-async def ver_json_crudo_real_del_mef():
+@app.get("/api/v1/debug-seace/{cui}")
+async def diagnosticar_scraper_seace(cui: str):
+    """
+    Muestra cómo se conecta Render con prod2.seace.gob.pe, qué IDs de formulario detecta
+    y qué filas extrae de la tabla naranja 'Códigos SNIP'.
+    """
+    debug_log: Dict[str, Any] = {}
+    debug_seace: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        resp = await client.get(
-            CKAN_SEARCH,
-            params={"resource_id": PRIMARY_RESOURCE_ID, "limit": 2},
-            timeout=15.0
-        )
-        try:
-            raw_json = resp.json()
-        except Exception:
-            raw_json = resp.text[:1000]
-
-        records_extraidos = extraer_records_de_respuesta_mef(raw_json) if isinstance(raw_json, (dict, list)) else []
-        columnas_detectadas = descubrir_columnas_cui_desde_filas(records_extraidos)
-
+        reg = await buscar_cui_en_mef(client, cui.strip(), debug_log)
+        resultado_seace = await extraer_tabla_seace_real(cui.strip(), reg or {}, debug_seace)
         return {
-            "http_status_mef": resp.status_code,
-            "url_consultada": str(resp.url),
-            "columnas_cui_autodectadas": columnas_detectadas,
-            "filas_extraidas_por_parser": len(records_extraidos),
-            "respuesta_cruda_exacta_del_mef": raw_json
+            "resultado_seace": resultado_seace,
+            "diagnostico_conexion_seace": debug_seace
         }
 
 
@@ -423,65 +439,39 @@ async def consultar_obra_cui(cui: str):
     cui_clean = cui.strip()
     if not cui_clean.isdigit() or len(cui_clean) < 6 or len(cui_clean) > 8:
         raise HTTPException(status_code=400, detail="El CUI debe tener entre 6 y 8 dígitos numéricos.")
-
     if len(set(cui_clean)) == 1:
-        raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} es un patrón inválido.")
+        raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} es inválido.")
 
     if cui_clean in CUI_MEMORY_CACHE:
         return CUI_MEMORY_CACHE[cui_clean]
 
     debug_log: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        registro, ssi_directo = await asyncio.gather(
-            buscar_cui_en_mef(client, cui_clean, debug_log),
-            consultar_ssi_directo(client, cui_clean)
-        )
+        registro = await buscar_cui_en_mef(client, cui_clean, debug_log)
+        if not registro:
+            raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} no se encontró.")
 
-        if not registro and not ssi_directo:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "mensaje": f"El CUI {cui_clean} no se encontró.",
-                    "diagnostico_ingenieria": debug_log
-                }
-            )
-
-        base_reg = registro or {}
-        resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, base_reg, ssi_directo)
-        resumen_seace = await consultar_seace_por_cui(client, cui_clean, base_reg)
+        resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, registro)
+        resumen_seace = await extraer_tabla_seace_real(cui_clean, registro)
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
-            "fuente": "API_DATOS_ABIERTOS_MEF + SSI + SEACE",
             "resumen_ssi_5_datos_clave": resumen_ssi,
-            "resumen_seace_5_datos_clave": resumen_seace,
-            "datos_proyecto": registro,
-            "enlaces_ecosistema": {
-                "ssi_mef": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui_clean}",
-                "ficha_invierte": f"https://ofi5.mef.gob.pe/invierte/ejecucion/verFichaEjecucion/{cui_clean}",
-                "seace": "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml",
-                "infobras": "https://infobras.contraloria.gob.pe/infobrasweb",
-                "consulta_amigable": "https://apps5.mineco.gob.pe/transparencia/Navegador/default.aspx",
-                "informes_cgr": "https://appbp.contraloria.gob.pe/BuscadorCGR/Informes/Avanzado.html",
-                "fup_oece": "https://apps.oece.gob.pe/perfilprov-ui/",
-                "djic_cgr": "https://appdji.contraloria.gob.pe/djic/",
-                "cuaderno_obra": "https://apps.osce.gob.pe/buscador-cuaderno-obra/search"
-            },
-            "diagnostico_ingenieria": debug_log
+            "resumen_seace": resumen_seace,
+            "datos_proyecto": registro
         }
-
         CUI_MEMORY_CACHE[cui_clean] = respuesta
         return respuesta
 
 
 @app.get("/api/v1/obra/{cui}/resumen-ssi")
 async def obtener_solo_5_datos_ssi(cui: str):
-    data_completa = await consultar_obra_cui(cui)
-    return data_completa["resumen_ssi_5_datos_clave"]
+    data = await consultar_obra_cui(cui)
+    return data["resumen_ssi_5_datos_clave"]
 
 
 @app.get("/api/v1/obra/{cui}/resumen-seace")
-async def obtener_solo_5_datos_seace(cui: str):
-    data_completa = await consultar_obra_cui(cui)
-    return data_completa["resumen_seace_5_datos_clave"]
+async def obtener_solo_datos_seace(cui: str):
+    data = await consultar_obra_cui(cui)
+    return data["resumen_seace"]

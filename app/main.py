@@ -8,8 +8,8 @@ from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana: Datos 100% reales de SSI-MEF y Tabla SEACE (Sin datos de relleno)",
-    version="4.4.0"
+    description="API de Veeduría Ciudadana: SSI-MEF + Motor Multi-Vía SEACE (JSF 3-Pasos + APIs Abiertas)",
+    version="4.5.0"
 )
 
 app.add_middleware(
@@ -20,7 +20,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CKAN_SEARCH = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1/datastore_search"
+CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
+CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
 PRIMARY_RESOURCE_ID = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"
 SEACE_URL = "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml"
 
@@ -127,17 +128,24 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: SCRAPER REAL JSF DE SEACE (AUTODESCUBRIMIENTO DEL FORMULARIO XHTML)
+# MÓDULO 2: MOTOR SEACE MULTI-VÍA (STATEFUL JSF + CKAN/OSCE)
 # =========================================================
 def extraer_html_de_respuesta_jsf(raw_text: str) -> str:
-    """
-    Si PrimeFaces devuelve un XML <partial-response><changes><update>...</update>,
-    extrae el contenido interno CDATA para que BeautifulSoup lea las filas <tr> sin problemas.
-    """
     bloques_cdata = re.findall(r"<!\[CDATA\[(.*?)\]\]>", raw_text, flags=re.DOTALL)
     if bloques_cdata:
         return "\n".join(bloques_cdata)
     return raw_text
+
+
+def extraer_viewstate(raw_text: str, current_vs: str = "") -> str:
+    vs_xml = re.search(r'id="[^"]*ViewState[^"]*"[^>]*>\s*<!\[CDATA\[(.*?)\]\]>', raw_text)
+    if vs_xml:
+        return vs_xml.group(1)
+    soup = BeautifulSoup(raw_text, "lxml")
+    vs_inp = soup.find("input", {"name": re.compile(r"ViewState", re.I)})
+    if vs_inp and vs_inp.get("value"):
+        return vs_inp["value"]
+    return current_vs
 
 
 def parsear_filas_reales_seace(raw_response_text: str) -> List[Dict[str, Any]]:
@@ -147,8 +155,6 @@ def parsear_filas_reales_seace(raw_response_text: str) -> List[Dict[str, Any]]:
 
     for tr in soup.find_all("tr"):
         celdas = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        # En la tabla de SEACE:
-        # [0:N°, 1:Entidad, 2:Fecha, 3:Nomenclatura, 4:Reiniciado, 5:Objeto, 6:Descripción, 7:SNIP, 8:CUI, 9:VR/Cuantía, 10:Moneda, 11:Versión]
         if len(celdas) >= 11 and celdas[0].isdigit() and "/" in celdas[2] and "-" in celdas[3]:
             cuantia = celdas[9]
             moneda = celdas[10]
@@ -165,73 +171,15 @@ def parsear_filas_reales_seace(raw_response_text: str) -> List[Dict[str, Any]]:
     return resultados
 
 
-def descubrir_estructura_formulario_seace(html_inicial: str) -> Dict[str, Any]:
-    """
-    Inspecciona el HTML real de buscadorPublico.xhtml para encontrar los nombres (name/id)
-    exactos del formulario de Procedimientos de Selección sin adivinarlos.
-    """
-    soup = BeautifulSoup(html_inicial, "lxml")
-    vs_input = soup.find("input", {"name": re.compile(r"ViewState", re.I)})
-    view_state = vs_input.get("value", "") if vs_input else ""
-
-    # Buscar todos los inputs/selects/botones relacionados con el buscador de procesos
-    campo_cui = None
-    campo_anio = None
-    boton_buscar = None
-    form_id = None
-    campos_base = {}
-
-    for form in soup.find_all("form"):
-        f_id = form.get("id") or form.get("name") or ""
-        html_form = str(form)
-        if "CodigoUnico" in html_form or "Proceso" in f_id or "anioConvocatoria" in html_form or "tbBuscador" in html_form:
-            form_id = f_id
-            for inp in form.find_all(["input", "select", "button", "a"]):
-                name_attr = inp.get("name") or inp.get("id") or ""
-                id_attr = inp.get("id") or ""
-                if not name_attr:
-                    continue
-
-                # Guardar valores por defecto de inputs ocultos o selects del formulario
-                if inp.name == "input" and inp.get("type") in ["hidden", "text"]:
-                    campos_base[name_attr] = inp.get("value", "")
-                elif inp.name == "select":
-                    opt_sel = inp.find("option", selected=True) or inp.find("option")
-                    if opt_sel and opt_sel.get("value") is not None:
-                        campos_base[name_attr] = opt_sel.get("value", "")
-
-                # Identificar campo de Código Único de Inversión
-                if any(k in name_attr.lower() for k in ["codigounico", "cui", "inversion"]):
-                    campo_cui = name_attr
-                # Identificar campo de Año de Convocatoria
-                if "anioconvocatoria" in name_attr.lower() and not name_attr.endswith("_focus"):
-                    campo_anio = name_attr
-                # Identificar botón Buscar de Procedimientos de Selección
-                texto_btn = inp.get_text(" ", strip=True).lower()
-                onclick_btn = inp.get("onclick", "")
-                if ("buscar" in name_attr.lower() or "buscar" in texto_btn) and "limpiar" not in name_attr.lower():
-                    if "proceso" in name_attr.lower() or "seltoken" in name_attr.lower() or not boton_buscar:
-                        boton_buscar = id_attr or name_attr
-
-    return {
-        "view_state": view_state,
-        "form_id": form_id or "tbBuscador:idFormBuscarProceso",
-        "campo_cui": campo_cui or "tbBuscador:idFormBuscarProceso:txtCodigoUnico",
-        "campo_anio": campo_anio or "tbBuscador:idFormBuscarProceso:anioConvocatoria_input",
-        "boton_buscar": boton_buscar or "tbBuscador:idFormBuscarProceso:btnBuscarSelToken",
-        "campos_base": campos_base
-    }
-
-
 def obtener_anios_busqueda(reg_mef: Dict[str, Any]) -> List[str]:
     anios = []
     for k in ["FEC_INI_EJECUCION", "FECHA_VIABILIDAD", "FECHA_REGISTRO", "FEC_INI_EJEC_FISICA"]:
         val = str(reg_mef.get(k, "")).strip()
         if len(val) >= 4 and val[:4].isdigit():
             y = int(val[:4])
-            for candidato in [str(y), str(y + 1), str(y + 2)]:
-                if 2015 <= int(candidato) <= 2026 and candidato not in anios:
-                    anios.append(candidato)
+            for cand in [str(y), str(y + 1), str(y - 1)]:
+                if 2015 <= int(cand) <= 2026 and cand not in anios:
+                    anios.append(cand)
     if not anios:
         anios = ["2026", "2025", "2024", "2023", "2022", "2021", "2020"]
     return anios[:4]
@@ -247,59 +195,111 @@ async def extraer_tabla_seace_real(cui: str, reg_mef: Dict[str, Any], debug_seac
     anio_exitoso = None
 
     try:
-        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=18.0) as client:
-            # 1. GET inicial para obtener Cookie JSESSIONID y descubrir IDs reales del formulario
+        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=16.0) as client:
+            # PASO 1: GET inicial a buscadorPublico.xhtml
             r_get = await client.get(SEACE_URL)
-            debug_seace["get_inicial_status"] = r_get.status_code
+            debug_seace["1_get_inicial_status"] = r_get.status_code
+            debug_seace["cookies_sesion"] = dict(client.cookies)
 
             if r_get.status_code == 200:
-                meta = descubrir_estructura_formulario_seace(r_get.text)
-                debug_seace["formulario_detectado"] = {
-                    "form_id": meta["form_id"],
-                    "campo_cui": meta["campo_cui"],
-                    "campo_anio": meta["campo_anio"],
-                    "boton_buscar": meta["boton_buscar"],
-                    "tiene_viewstate": bool(meta["view_state"])
+                vs = extraer_viewstate(r_get.text)
+                debug_seace["viewstate_inicial_ok"] = bool(vs)
+
+                headers_ajax = {
+                    **HEADERS,
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Faces-Request": "partial/ajax",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://prod2.seace.gob.pe",
+                    "Referer": SEACE_URL
                 }
 
-                if meta["view_state"]:
-                    for anio in anios_a_probar:
-                        payload = dict(meta["campos_base"])
-                        payload.update({
-                            "javax.faces.partial.ajax": "true",
-                            "javax.faces.source": meta["boton_buscar"],
-                            "javax.faces.partial.execute": "@all",
-                            "javax.faces.partial.render": "@all",
-                            meta["boton_buscar"]: meta["boton_buscar"],
-                            meta["form_id"]: meta["form_id"],
-                            meta["campo_cui"]: cui,
-                            meta["campo_anio"]: anio,
-                            "javax.faces.ViewState": meta["view_state"]
-                        })
+                # PASO 2: Cambiar en el servidor JSF de la Pestaña 0 ("Anuncio Futura") a la Pestaña 1 ("Procedimientos de Selección")
+                payload_tab = {
+                    "javax.faces.partial.ajax": "true",
+                    "javax.faces.source": "tbBuscador",
+                    "javax.faces.partial.execute": "tbBuscador",
+                    "javax.faces.partial.render": "tbBuscador",
+                    "javax.faces.behavior.event": "tabChange",
+                    "javax.faces.partial.event": "tabChange",
+                    "tbBuscador_newTab": "tbBuscador:idTab2",
+                    "tbBuscador_tabindex": "1",
+                    "tbBuscador_activeIndex": "1",
+                    "javax.faces.ViewState": vs
+                }
+                r_tab = await client.post(SEACE_URL, data=payload_tab, headers=headers_ajax)
+                debug_seace["2_cambio_pestana_status"] = r_tab.status_code
+                if r_tab.status_code == 200:
+                    vs = extraer_viewstate(r_tab.text, vs)
 
-                        headers_post = {
-                            **HEADERS,
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "Faces-Request": "partial/ajax",
-                            "X-Requested-With": "XMLHttpRequest",
-                            "Origin": "https://prod2.seace.gob.pe",
-                            "Referer": SEACE_URL
-                        }
+                # Inspeccionar todos los inputs disponibles después del cambio de pestaña
+                html_activo = extraer_html_de_respuesta_jsf(r_tab.text) if r_tab.status_code == 200 else r_get.text
+                soup_activo = BeautifulSoup(html_activo + "\n" + r_get.text, "lxml")
 
-                        r_post = await client.post(SEACE_URL, data=payload, headers=headers_post)
-                        debug_seace[f"post_{anio}_status"] = r_post.status_code
+                inputs_detectados = [
+                    inp.get("name") or inp.get("id")
+                    for inp in soup_activo.find_all(["input", "select", "button", "a"])
+                    if (inp.get("name") or inp.get("id")) and "tbBuscador" in (inp.get("name") or inp.get("id") or "")
+                ]
+                debug_seace["inputs_tbbuscador_detectados"] = inputs_detectados[:35]
 
-                        if r_post.status_code == 200:
-                            # Actualizar ViewState si el servidor rotó el token en la respuesta XML
-                            vs_match = re.search(r'id=".*?ViewState.*?"[^>]*>\s*<!\[CDATA\[(.*?)\]\]>', r_post.text)
-                            if vs_match:
-                                meta["view_state"] = vs_match.group(1)
+                # Identificar exactamente los IDs de la pestaña de Procedimientos de Selección
+                id_form = "tbBuscador:idFormBuscarProceso"
+                id_cui = "tbBuscador:idFormBuscarProceso:txtCodigoUnico"
+                id_anio = "tbBuscador:idFormBuscarProceso:anioConvocatoria_input"
+                id_version = "tbBuscador:idFormBuscarProceso:versionSeace_input"
+                id_btn = "tbBuscador:idFormBuscarProceso:btnBuscarSelToken"
 
-                            filas = parsear_filas_reales_seace(r_post.text)
-                            if filas:
-                                procedimientos_encontrados.extend(filas)
-                                anio_exitoso = anio
-                                break
+                for item_id in inputs_detectados:
+                    low = item_id.lower()
+                    if "codigounico" in low:
+                        id_cui = item_id
+                    elif "anioconvocatoria_input" in low:
+                        id_anio = item_id
+                    elif "btnbuscarsel" in low:
+                        id_btn = item_id
+
+                debug_seace["ids_usados_en_post"] = {
+                    "form": id_form,
+                    "cui": id_cui,
+                    "anio": id_anio,
+                    "btn": id_btn
+                }
+
+                # PASO 3: Enviar la búsqueda del CUI en la Pestaña 1 para cada año candidato
+                for anio in anios_a_probar:
+                    payload_search = {
+                        "javax.faces.partial.ajax": "true",
+                        "javax.faces.source": id_btn,
+                        "javax.faces.partial.execute": id_form,
+                        "javax.faces.partial.render": f"{id_form}:dtProcesos {id_form}:pnlMsj",
+                        id_btn: id_btn,
+                        id_form: id_form,
+                        f"{id_form}:txtNombreEntidad": "",
+                        f"{id_form}:idObjetoContratacion_input": "",
+                        f"{id_form}:descripcionObjeto": "",
+                        id_version: "3",
+                        id_anio: anio,
+                        id_cui: cui,
+                        f"{id_form}:codigoSnip": "",
+                        "tbBuscador_activeIndex": "1",
+                        "javax.faces.ViewState": vs
+                    }
+
+                    r_post = await client.post(SEACE_URL, data=payload_search, headers=headers_ajax)
+                    debug_seace[f"3_post_{anio}_status"] = r_post.status_code
+                    debug_seace[f"3_post_{anio}_len"] = len(r_post.text)
+
+                    if r_post.status_code == 200:
+                        vs = extraer_viewstate(r_post.text, vs)
+                        if anio == anios_a_probar[0]:
+                            debug_seace["muestra_respuesta_xml_seace"] = r_post.text[:600]
+
+                        filas = parsear_filas_reales_seace(r_post.text)
+                        if filas:
+                            procedimientos_encontrados.extend(filas)
+                            anio_exitoso = anio
+                            break
     except Exception as e:
         debug_seace["seace_exception"] = f"{type(e).__name__}: {str(e)}"
 
@@ -406,7 +406,7 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.4 - 100% Datos Reales SEACE",
+        "servicio": "DatePublic API v4.5 - Diagnóstico y Extracción SEACE",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
@@ -419,8 +419,8 @@ def root():
 @app.get("/api/v1/debug-seace/{cui}")
 async def diagnosticar_scraper_seace(cui: str):
     """
-    Muestra cómo se conecta Render con prod2.seace.gob.pe, qué IDs de formulario detecta
-    y qué filas extrae de la tabla naranja 'Códigos SNIP'.
+    Ejecuta el flujo de 3 pasos sobre SEACE y devuelve los IDs exactos del formulario
+    y el XML crudo que responde prod2.seace.gob.pe.
     """
     debug_log: Dict[str, Any] = {}
     debug_seace: Dict[str, Any] = {}

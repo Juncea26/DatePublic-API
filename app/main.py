@@ -3,12 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
 import re
+import uuid
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana (SSI-MEF + Inspector de Chunk 5 Cuaderno de Obra y WS MEF)",
-    version="4.8.4"
+    description="API de Veeduría Ciudadana (SSI-MEF + Prueba Directa Cuaderno/Contratos OSCE y Catálogo MEF)",
+    version="4.8.5"
 )
 
 app.add_middleware(
@@ -125,50 +126,82 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: EXTRACTOR DEL CHUNK 5 (CUADERNO DE OBRA / SEACE) Y WS DEL MEF
+# MÓDULO 2: PRUEBA EN VIVO DE CUADERNO DE OBRA / SEACE Y CATÁLOGO MEF
 # =========================================================
 @app.get("/api/v1/probar-fuentes-peruanas/{cui}")
-async def extraer_chunk5_osce_y_ws_mef(cui: str):
-    chunk5_url = "https://apps.osce.gob.pe/buscador-cuaderno-obra/5-es2015.d709a4ac1a7eb2feac28.js"
-    mef_js_url = "https://datosabiertos.mef.gob.pe/main-HSI2723K.js"
-
+async def probar_busqueda_cuaderno_y_catalogo_mef(cui: str):
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=15.0) as client:
-        r_chunk5, r_mef_js, r_fup_test = await asyncio.gather(
-            client.get(chunk5_url),
-            client.get(mef_js_url),
-            client.get("https://eap.oece.gob.pe/perfilprov-bus/1.0/tarjetas?searchText=20131312955&pageNumber=1&pageSize=5"),
-            return_exceptions=True
-        )
+        # 1. Leer main-HSI2723K.js para extraer Rp.endpoint y TODOS los endpoints de PortalWeb/v1.0
+        r_mef_js = await client.get("https://datosabiertos.mef.gob.pe/main-HSI2723K.js")
+        txt_mef = r_mef_js.text if r_mef_js.status_code == 200 else ""
 
-        # 1. Extraer todos los endpoints REST del Chunk 5 del Buscador de Cuaderno de Obra
-        chunk5_info: Dict[str, Any] = {"url": chunk5_url}
-        if isinstance(r_chunk5, httpx.Response):
-            txt5 = r_chunk5.text
-            chunk5_info["status"] = r_chunk5.status_code
-            chunk5_info["size_bytes"] = len(txt5)
-            chunk5_info["llamadas_http"] = re.findall(r'.{0,60}(?:http\.get|http\.post|soec|urlBase|buscador|cuaderno|obra|cui|snip|entidad|contrato).{0,140}', txt5, re.I)[:60]
+        rp_match = re.findall(r'.{0,100}PortalWeb.{0,150}', txt_mef)
+        endpoint_defs = re.findall(r'endpoint\s*:\s*["\']([^"\']+)["\']', txt_mef)
+        todas_ws = re.findall(r'this\.ws\(\s*["\']([^"\']+)["\']', txt_mef)
 
-        # 2. Extraer la definición de this.ws(...) y this.url en main-HSI2723K.js del MEF
-        mef_ws_info: Dict[str, Any] = {}
-        if isinstance(r_mef_js, httpx.Response):
-            txtm = r_mef_js.text
-            mef_ws_info["llamadas_this_ws"] = re.findall(r'.{0,50}this\.ws\(.{0,130}', txtm)[:50]
-            mef_ws_info["definicion_url_backend"] = re.findall(r'.{0,60}(?:this\.url\s*=|apiUrl|urlBase|DatosAbiertos|id_token).{0,130}', txtm)[:40]
-
-        # 3. Ver respuesta en vivo del buscador de proveedores/contratos de eap.oece.gob.pe
-        fup_live = {}
-        if isinstance(r_fup_test, httpx.Response):
-            fup_live = {
-                "status": r_fup_test.status_code,
-                "respuesta_json": r_fup_test.text[:600]
+        # 2. Consultar directamente el backend PortalWeb del MEF si se detectó endpoint
+        mef_portal_resp = {}
+        base_portal = endpoint_defs[0] if endpoint_defs else "https://api.datosabiertos.mef.gob.pe"
+        token_uuid = str(uuid.uuid4())
+        try:
+            url_init = f"{base_portal.rstrip('/')}/PortalWeb/v1.0/getInitialInfo"
+            r_init = await client.post(url_init, json={}, headers={**HEADERS, "Token": token_uuid, "Content-Type": "application/json"})
+            mef_portal_resp["getInitialInfo"] = {
+                "url": url_init,
+                "status": r_init.status_code,
+                "body": r_init.text[:1000]
             }
-        else:
-            fup_live = {"error": str(r_fup_test)}
+        except Exception as e:
+            mef_portal_resp["error"] = str(e)
+
+        # 3. Probar sesión y búsqueda por CUI en https://eap.oece.gob.pe/soec-bus/1.0/cuaderno-obra/b01/buscar
+        cuaderno_test = {}
+        try:
+            # Paso A: Obtener sesión temporal c01 si existe
+            r_ses = await client.get(
+                "https://eap.oece.gob.pe/soec-seg/1.0/temp/sesiones/contextos/c01",
+                headers={**HEADERS, "Origin": "https://apps.osce.gob.pe", "Referer": "https://apps.osce.gob.pe/buscador-cuaderno-obra/"}
+            )
+            cuaderno_test["sesion_c01_status"] = r_ses.status_code
+            cuaderno_test["sesion_c01_body"] = r_ses.text[:300]
+
+            # Paso B: POST a /cuaderno-obra/b01/buscar con el CUI
+            payload_b01 = {
+                "valAnoSusCont": None,
+                "valContrato": "",
+                "valCui": int(cui) if cui.isdigit() else cui,
+                "valEntidad": "",
+                "valObra": "",
+                "valProvCont": "",
+                "valUbigeo": "000000",
+                "valObjCont": None,
+                "pageNumber": 1,
+                "pageSize": 10,
+                "tokenCaptcha": "test"
+            }
+            r_bus = await client.post(
+                "https://eap.oece.gob.pe/soec-bus/1.0/cuaderno-obra/b01/buscar",
+                json=payload_b01,
+                headers={
+                    **HEADERS,
+                    "Content-Type": "application/json",
+                    "Origin": "https://apps.osce.gob.pe",
+                    "Referer": "https://apps.osce.gob.pe/buscador-cuaderno-obra/search"
+                }
+            )
+            cuaderno_test["buscar_b01_status"] = r_bus.status_code
+            cuaderno_test["buscar_b01_body"] = r_bus.text[:800]
+        except Exception as e:
+            cuaderno_test["error"] = str(e)
 
         return {
-            "1_chunk5_buscador_cuaderno_obra_endpoints": chunk5_info,
-            "2_mef_catalogo_ws_interno": mef_ws_info,
-            "3_prueba_en_vivo_eap_oece_fup": fup_live
+            "1_mef_portal_endpoints_detectados": {
+                "endpoint_defs": endpoint_defs,
+                "todas_las_rutas_this_ws": list(set(todas_ws)),
+                "contexto_PortalWeb": rp_match[:25]
+            },
+            "2_mef_portal_respuesta_en_vivo": mef_portal_resp,
+            "3_osce_cuaderno_obra_prueba_cui": cuaderno_test
         }
 
 
@@ -266,7 +299,7 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.8.4 - Extractor Chunk 5 OSCE y WS MEF",
+        "servicio": "DatePublic API v4.8.5 - Prueba Directa OSCE B01 + Catálogo MEF",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",

@@ -6,9 +6,9 @@ import uuid
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
-    title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana: SSI-MEF + Componentes Físicos F8 + Inspector de Tablas MEF",
-    version="5.0.2"
+    title="DatePublic API - Motor de Auditoría CUI Perú",
+    description="API de Veeduría Ciudadana: SSI + Expedientes Técnicos + Estado Situacional/Riesgos + Componentes F8",
+    version="5.1.0"
 )
 
 app.add_middleware(
@@ -23,11 +23,12 @@ CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
 CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
 MEF_REST_BASE = "https://datosabiertos.mef.gob.pe/Rest"
 
-RESOURCE_DETALLE_INV = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"       # DETALLE_INVERSIONES.csv
-RESOURCE_COMPONENTES = "79e51378-613e-4886-9743-1426c064f8f1"       # Componentes Físicos de la Inversión
-RESOURCE_EXPEDIENTES_ET = "b782e8d4-cce5-45c8-8675-6959100aa360"    # INVERSIONES_ET.csv
-RESOURCE_ESTADO_SITUACIONAL = "2c20b8e2-7bd9-41ba-8239-8f8c9571935a" # ESTADO_SITUACIONAL.csv
-RESOURCE_FORMATO_12B = "c275fa9f-5c61-4313-828d-0827277bdd97"       # FORMATO_12B.csv
+# Resource IDs oficiales de Datos Abiertos MEF (100% accesibles desde Render)
+RESOURCE_DETALLE_INV = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"        # DETALLE_INVERSIONES.csv (SSI)
+RESOURCE_EXPEDIENTES_ET = "b782e8d4-cce5-45c8-8675-6959100aa360"     # INVERSIONES_ET.csv (Resoluciones y Modificaciones ET)
+RESOURCE_ESTADO_SITUACIONAL = "2c20b8e2-7bd9-41ba-8239-8f8c9571935a" # ESTADO_SITUACIONAL.csv (Situación F12B y Riesgos)
+RESOURCE_COMPONENTES = "79e51378-613e-4886-9743-1426c064f8f1"        # Componentes y Metas Físicas F8
+RESOURCE_CIERRE_INV = "7c6fe48e-f124-4d21-b32b-68f7e59f29b8"         # CIERRE_INVERSIONES.csv (Formato 9)
 
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
 DETECTED_COLUMNS_CACHE: Dict[str, List[str]] = {}
@@ -133,12 +134,9 @@ async def buscar_filas_por_cui_en_recurso(
     consultas = [
         client.get(CKAN_SEARCH, params={"resource_id": resource_id, "q": cui, "limit": limite}, timeout=14.0),
     ]
-    for col in columnas_cui[:3]:
+    for col in columnas_cui[:2]:
         consultas.append(
             client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": f'{{"{col}":"{cui}"}}', "limit": limite}, timeout=14.0)
-        )
-        consultas.append(
-            client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": f'{{"{col}":{int(cui)}}}', "limit": limite}, timeout=14.0)
         )
 
     respuestas = await asyncio.gather(*consultas, return_exceptions=True)
@@ -220,6 +218,7 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
                 "fecha_registro": formatear_fecha_corta(fuente.get("FECHA_REGISTRO")),
                 "fecha_viabilidad": formatear_fecha_corta(fuente.get("FECHA_VIABILIDAD")),
                 "fecha_inicio_ejecucion": formatear_fecha_corta(fuente.get("FEC_INI_EJECUCION")),
+                "fecha_inicio_ejecucion_fisica": formatear_fecha_corta(fuente.get("FEC_INI_EJEC_FISICA")),
                 "fecha_fin_ejecucion": formatear_fecha_corta(fuente.get("FEC_FIN_EJECUCION")),
                 "beneficiarios_habitantes": f"{beneficiarios_num:,} habitantes"
             }
@@ -228,10 +227,72 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: COMPONENTES Y METAS FÍSICAS VIGENTES (SIN FILAS EN CERO NI REPETIDAS)
+# MÓDULO 2: EXPEDIENTES TÉCNICOS Y MODIFICACIONES PRESUPUESTALES (INVERSIONES_ET.csv)
+# =========================================================
+def estructurar_expedientes_tecnicos(cui: str, filas_et: List[Dict[str, Any]]) -> Dict[str, Any]:
+    resoluciones_unicas = []
+    vistos_et = set()
+
+    for r in filas_et:
+        doc_res = str(r.get("DES_EXP_TECNICO", "")).strip()
+        motivo = str(r.get("NUM_DOC_APROBACION", "")).strip()
+        fec_aprob = formatear_fecha_corta(r.get("FEC_APROBACION"))
+        clave = f"{doc_res}_{motivo}_{fec_aprob}"
+        if clave not in vistos_et:
+            vistos_et.add(clave)
+            mto_inicial = a_float(r.get("PRIM_MTO_ET"))
+            mto_ultimo = a_float(r.get("ULT_MTO_ET"))
+            resoluciones_unicas.append({
+                "1_resolucion_aprobacion": doc_res or "No especificada",
+                "2_motivo_o_modificacion": motivo or "Aprobación de Expediente Técnico",
+                "3_fecha_aprobacion": fec_aprob,
+                "4_monto_inicial_et": formatear_soles(mto_inicial),
+                "5_monto_modificado_et": formatear_soles(mto_ultimo),
+                "incremento_presupuestal": formatear_soles(max(0.0, mto_ultimo - mto_inicial))
+            })
+
+    return {
+        "cui": cui,
+        "total_resoluciones_et": len(resoluciones_unicas),
+        "historial_expediente_tecnico": resoluciones_unicas
+    }
+
+
+# =========================================================
+# MÓDULO 3: ESTADO SITUACIONAL, AVANCE F12B Y RIESGOS (ESTADO_SITUACIONAL.csv)
+# =========================================================
+def estructurar_estado_situacional_y_riesgos(cui: str, filas_sit: List[Dict[str, Any]]) -> Dict[str, Any]:
+    situacion_general = []
+    problemas_y_acciones = []
+    riesgos_detectados = []
+
+    for r in filas_sit:
+        desc = str(r.get("DESCRIPCION", "")).strip()
+        if not desc:
+            continue
+        tipo = str(r.get("TIP_REGISTRO", "")).strip().upper()
+        fecha = formatear_fecha_corta(r.get("FECHA_REGISTRO"))
+        item = {"fecha": fecha, "tipo": tipo, "detalle": desc}
+
+        if "SITGNRAL" in tipo:
+            situacion_general.append(item)
+        elif "RIESGO" in tipo:
+            riesgos_detectados.append(item)
+        else:
+            problemas_y_acciones.append(item)
+
+    return {
+        "cui": cui,
+        "resumen_situacion_actual_f12b": situacion_general,
+        "problemas_y_acciones_reportadas": problemas_y_acciones,
+        "alertas_y_riesgos_registrados": riesgos_detectados
+    }
+
+
+# =========================================================
+# MÓDULO 4: COMPONENTES Y METAS FÍSICAS VIGENTES (SIN DUPLICADOS NI CEROS)
 # =========================================================
 def estructurar_componentes_limpios(cui: str, filas_comp: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Filtrar solo componentes con costo > 0, priorizando la etapa 'Ejecución física (C)'
     con_costo = [r for r in filas_comp if a_float(r.get("COSTO_INVERSION")) > 0]
     ejecucion_c = [r for r in con_costo if "EJECUCI" in str(r.get("DES_ETAPA", "")).upper()]
     seleccionadas = ejecucion_c if ejecucion_c else con_costo
@@ -264,25 +325,22 @@ def estructurar_componentes_limpios(cui: str, filas_comp: List[Dict[str, Any]]) 
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v5.0.2 - SSI + Componentes F8 + Inspector de Tablas MEF",
+        "servicio": "DatePublic API v5.1.0 - Auditoría Integral de Obras Públicas",
         "endpoints": {
-            "obra_completa": "/api/v1/obra/{cui}",
-            "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
-            "inspeccionar_todas_las_tablas_mef": "/api/v1/esquema-seace/{cui}"
+            "auditoria_completa_cui": "/api/v1/obra/{cui}",
+            "solo_5_datos_ssi": "/api/v1/obra/{cui}/resumen-ssi",
+            "solo_expedientes_y_situacion": "/api/v1/obra/{cui}/expediente-y-situacion",
+            "explorar_consulta_amigable": "/api/v1/explorar-consulta-amigable"
         }
     }
 
 
-@app.get("/api/v1/esquema-seace/{cui}")
-async def inspeccionar_todas_las_tablas_mef_para_cui(cui: str):
+@app.get("/api/v1/explorar-consulta-amigable")
+async def obtener_resource_ids_consulta_amigable():
     """
-    Revisa qué datos exactos existen para este CUI en:
-    - INVERSIONES_ET (Expedientes Técnicos)
-    - ESTADO_SITUACIONAL
-    - FORMATO_12B
-    Y lista los datasets de Presupuesto Público para ver si hay tabla de Contratos/SEACE.
+    Obtiene los resource_id del dataset 'comparacion-de-presupuesto-ejecucion-gasto' (Consulta Amigable SIAF)
+    y las páginas 2, 3 y 4 del catálogo de Presupuesto Público.
     """
-    cui_clean = cui.strip()
     token_uuid = str(uuid.uuid4())
     headers_rest = {
         **HEADERS,
@@ -291,37 +349,31 @@ async def inspeccionar_todas_las_tablas_mef_para_cui(cui: str):
         "Origin": "https://datosabiertos.mef.gob.pe",
         "Referer": "https://datosabiertos.mef.gob.pe/"
     }
-
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=20.0) as client:
-        filas_et, filas_sit, filas_f12b, r_presupuesto = await asyncio.gather(
-            buscar_filas_por_cui_en_recurso(client, RESOURCE_EXPEDIENTES_ET, cui_clean, limite=10),
-            buscar_filas_por_cui_en_recurso(client, RESOURCE_ESTADO_SITUACIONAL, cui_clean, limite=10),
-            buscar_filas_por_cui_en_recurso(client, RESOURCE_FORMATO_12B, cui_clean, limite=10),
+    async with httpx.AsyncClient(headers=headers_rest, verify=False, follow_redirects=True, timeout=20.0) as client:
+        r_ca, r_p2, r_p3, r_p4 = await asyncio.gather(
+            client.post(
+                f"{MEF_REST_BASE}/PortalWebDatasetDetalle/v1.0/getDatasetDetalle",
+                json={"dataset": "comparacion-de-presupuesto-ejecucion-gasto"}
+            ),
             client.post(
                 f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos",
-                json={"category": "presupuesto-publico", "page": 1, "tags": [""], "formats": [""], "search": "", "order": "asc"},
-                headers=headers_rest
+                json={"category": "presupuesto-publico", "page": 2, "tags": [""], "formats": [""], "search": "", "order": "asc"}
+            ),
+            client.post(
+                f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos",
+                json={"category": "presupuesto-publico", "page": 3, "tags": [""], "formats": [""], "search": "", "order": "asc"}
+            ),
+            client.post(
+                f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos",
+                json={"category": "presupuesto-publico", "page": 4, "tags": [""], "formats": [""], "search": "", "order": "asc"}
             ),
             return_exceptions=True
         )
-
-        presupuesto_datasets = r_presupuesto.json() if isinstance(r_presupuesto, httpx.Response) else str(r_presupuesto)
-
         return {
-            "cui": cui_clean,
-            "1_tabla_expedientes_tecnicos_ET": {
-                "total_filas": len(filas_et) if isinstance(filas_et, list) else 0,
-                "filas": filas_et if isinstance(filas_et, list) else str(filas_et)
-            },
-            "2_tabla_estado_situacional": {
-                "total_filas": len(filas_sit) if isinstance(filas_sit, list) else 0,
-                "filas": filas_sit if isinstance(filas_sit, list) else str(filas_sit)
-            },
-            "3_tabla_formato_12b": {
-                "total_filas": len(filas_f12b) if isinstance(filas_f12b, list) else 0,
-                "filas": filas_f12b if isinstance(filas_f12b, list) else str(filas_f12b)
-            },
-            "4_catalogo_presupuesto_publico": presupuesto_datasets
+            "1_resource_ids_consulta_amigable_gasto": r_ca.json() if isinstance(r_ca, httpx.Response) else str(r_ca),
+            "2_presupuesto_pagina_2": r_p2.json() if isinstance(r_p2, httpx.Response) else str(r_p2),
+            "3_presupuesto_pagina_3": r_p3.json() if isinstance(r_p3, httpx.Response) else str(r_p3),
+            "4_presupuesto_pagina_4": r_p4.json() if isinstance(r_p4, httpx.Response) else str(r_p4)
         }
 
 
@@ -338,8 +390,10 @@ async def consultar_obra_cui(cui: str):
         return CUI_MEMORY_CACHE[cui_clean]
 
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        filas_detalle, filas_comp = await asyncio.gather(
+        filas_detalle, filas_et, filas_sit, filas_comp = await asyncio.gather(
             buscar_filas_por_cui_en_recurso(client, RESOURCE_DETALLE_INV, cui_clean, limite=5),
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_EXPEDIENTES_ET, cui_clean, limite=15),
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_ESTADO_SITUACIONAL, cui_clean, limite=20),
             buscar_filas_por_cui_en_recurso(client, RESOURCE_COMPONENTES, cui_clean, limite=35)
         )
 
@@ -348,13 +402,17 @@ async def consultar_obra_cui(cui: str):
 
         registro = filas_detalle[0]
         resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, registro)
+        resumen_et = estructurar_expedientes_tecnicos(cui_clean, filas_et)
+        resumen_situacion = estructurar_estado_situacional_y_riesgos(cui_clean, filas_sit)
         resumen_componentes = estructurar_componentes_limpios(cui_clean, filas_comp)
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
-            "fuente": "API_DATOS_ABIERTOS_MEF",
+            "fuente": "API_DATOS_ABIERTOS_MEF (SSI + EXPEDIENTES_ET + ESTADO_SITUACIONAL + COMPONENTES)",
             "resumen_ssi_5_datos_clave": resumen_ssi,
+            "resumen_expedientes_y_modificaciones": resumen_et,
+            "resumen_estado_situacional_y_riesgos": resumen_situacion,
             "resumen_componentes_fisicos_obra": resumen_componentes,
             "datos_proyecto": registro
         }
@@ -366,3 +424,14 @@ async def consultar_obra_cui(cui: str):
 async def obtener_solo_5_datos_ssi(cui: str):
     data = await consultar_obra_cui(cui)
     return data["resumen_ssi_5_datos_clave"]
+
+
+@app.get("/api/v1/obra/{cui}/expediente-y-situacion")
+async def obtener_expediente_y_situacion(cui: str):
+    data = await consultar_obra_cui(cui)
+    return {
+        "cui": data["cui"],
+        "expedientes_tecnicos": data["resumen_expedientes_y_modificaciones"],
+        "estado_situacional_y_riesgos": data["resumen_estado_situacional_y_riesgos"],
+        "componentes_fisicos": data["resumen_componentes_fisicos_obra"]
+    }

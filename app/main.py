@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, List, Union
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
     description="API de Veeduría Ciudadana en Tiempo Real: SSI-MEF + Procesos de Selección SEACE (Datos Abiertos MEF)",
-    version="5.0.0"
+    version="5.0.1"
 )
 
 app.add_middleware(
@@ -123,9 +123,6 @@ async def buscar_filas_por_cui_en_recurso(
     cui: str,
     limite: int = 25
 ) -> List[Dict[str, Any]]:
-    """
-    Busca todas las filas que coincidan con el CUI dentro de cualquier tabla resource_id del MEF.
-    """
     if resource_id not in DETECTED_COLUMNS_CACHE:
         try:
             r_sample = await client.get(CKAN_SEARCH, params={"resource_id": resource_id, "limit": 2}, timeout=10.0)
@@ -159,7 +156,7 @@ async def buscar_filas_por_cui_en_recurso(
                 records = extraer_records_de_respuesta_mef(resp.json())
                 for row in records:
                     if fila_contiene_cui(row, cui):
-                         huella = str(sorted(row.items()))
+                        huella = str(sorted(row.items()))
                         if huella not in vistos:
                             vistos.add(huella)
                             filas_unicas.append(row)
@@ -271,7 +268,6 @@ def estructurar_5_datos_seace(cui: str, filas_seace: List[Dict[str, Any]]) -> Di
         if estado_proc:
             item_limpio["estado"] = estado_proc
 
-        # Incluir los campos originales exactos de la fila para total transparencia
         item_limpio["datos_oficiales_fila"] = row
         procesos_limpios.append(item_limpio)
 
@@ -290,7 +286,7 @@ def estructurar_5_datos_seace(cui: str, filas_seace: List[Dict[str, Any]]) -> Di
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v5.0 - SSI + SEACE Oficial (Datos Abiertos MEF)",
+        "servicio": "DatePublic API v5.0.1 - SSI + SEACE Oficial (Datos Abiertos MEF)",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
@@ -302,10 +298,6 @@ def root():
 
 @app.get("/api/v1/esquema-seace/{cui}")
 async def inspeccionar_columnas_reales_proceso_seleccion(cui: str):
-    """
-    Muestra una muestra general de la tabla PROCESO_SELECCION.csv (79e51378-613e-4886-9743-1426c064f8f1)
-    y todas las filas que coincidan con el CUI indicado.
-    """
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
         r_muestra, filas_cui = await asyncio.gather(
             client.get(CKAN_SEARCH, params={"resource_id": RESOURCE_PROCESOS_SEACE, "limit": 2}, timeout=12.0),

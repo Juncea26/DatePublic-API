@@ -3,13 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
 import re
-from bs4 import BeautifulSoup
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana (SSI-MEF + Extractor Profundo de Rutas API OSCE/MEF)",
-    version="4.8.1"
+    description="API de Veeduría Ciudadana (SSI-MEF + Extractor de Catálogo main-HSI2723K.js y eap.oece.gob.pe)",
+    version="4.8.2"
 )
 
 app.add_middleware(
@@ -29,7 +28,7 @@ DETECTED_COLUMNS_CACHE: List[str] = []
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*"
+    "Accept": "application/json, text/plain, */*"
 }
 
 
@@ -126,71 +125,48 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: EXTRACTOR PROFUNDO DE VARIABLES API EN BUNDLES JS Y PORTAL MEF
+# MÓDULO 2: INSPECTOR DE main-HSI2723K.js (MEF) Y eap.oece.gob.pe (OSCE)
 # =========================================================
-async def inspeccionar_js_profundo(client: httpx.AsyncClient, js_url: str) -> Dict[str, Any]:
-    res: Dict[str, Any] = {"js_url": js_url}
-    try:
-        r = await client.get(js_url, timeout=12.0)
-        res["status"] = r.status_code
-        res["size_bytes"] = len(r.text)
-        if r.status_code == 200:
-            txt = r.text
-            # 1. Buscar cualquier llamada .get(...) o .post(...) en el servicio Angular
-            llamadas_http = list(set(re.findall(r'\.(?:get|post)\s*(?:<[^>]+>)?\s*\(([^)]{3,120})\)', txt)))
-            # 2. Buscar asignaciones de variables con palabras clave de URL/API/Backend
-            variables_api = list(set(re.findall(r'[a-zA-Z0-9_]*(?:Url|URL|Api|API|Endpoint|Host|Server|Base|Context|Service|Path)[a-zA-Z0-9_]*\s*:\s*["\']([^"\']+)["\']', txt)))
-            # 3. Buscar todos los strings entre comillas que tengan barras '/' y parezcan endpoints REST
-            strings_con_barra = list(set(re.findall(r'["\']([a-zA-Z0-9_\-\.]{2,40}/[a-zA-Z0-9_\-\./\?=&]{2,80})["\']', txt)))
-            strings_filtrados = [
-                s for s in strings_con_barra
-                if not any(ign in s.lower() for ign in ["assets/", "node_modules", "material", "angular", "svg", "image/", "text/", "application/", "xliff"])
-            ]
-
-            res["variables_config_api"] = variables_api[:40]
-            res["llamadas_http_get_post"] = llamadas_http[:40]
-            res["rutas_rest_detectadas"] = strings_filtrados[:50]
-    except Exception as e:
-        res["error"] = str(e)
-    return res
-
-
-async def explorar_portal_mef_profundo(client: httpx.AsyncClient) -> Dict[str, Any]:
-    info: Dict[str, Any] = {}
-    try:
-        r = await client.get("https://datosabiertos.mef.gob.pe/", timeout=10.0)
-        info["home_status"] = r.status_code
-        soup = BeautifulSoup(r.text, "lxml")
-        enlaces = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            texto = a.get_text(" ", strip=True)
-            if href and not href.startswith("#") and not href.startswith("javascript"):
-                enlaces.append({"texto": texto[:60], "href": href})
-        info["enlaces_portada"] = enlaces[:35]
-
-        # Buscar scripts o llamadas AJAX en la portada de datosabiertos.mef.gob.pe
-        scripts_mef = [s.get("src") for s in soup.find_all("script") if s.get("src")]
-        info["scripts_mef"] = scripts_mef
-        info["muestra_html"] = r.text[:800]
-    except Exception as e:
-        info["error"] = str(e)
-    return info
-
-
 @app.get("/api/v1/probar-fuentes-peruanas/{cui}")
-async def descubrir_apis_internas_abiertas(cui: str):
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        cuaderno_js, fup_js, mef_web = await asyncio.gather(
-            inspeccionar_js_profundo(client, "https://apps.osce.gob.pe/buscador-cuaderno-obra/main-es2015.938f7af282f717dbf663.js"),
-            inspeccionar_js_profundo(client, "https://apps.oece.gob.pe/perfilprov-ui/main.2b917411c9b9e438549e.js"),
-            explorar_portal_mef_profundo(client),
+async def descubrir_endpoints_exactos_mef_y_oece(cui: str):
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=12.0) as client:
+        # 1. Leer el bundle de Angular del Portal de Datos Abiertos del MEF
+        r_mef_js, r_cuaderno_js, r_oece_test = await asyncio.gather(
+            client.get("https://datosabiertos.mef.gob.pe/main-HSI2723K.js"),
+            client.get("https://apps.osce.gob.pe/buscador-cuaderno-obra/main-es2015.938f7af282f717dbf663.js"),
+            client.get("https://eap.oece.gob.pe/soec-bus/1.0/ubigeo/selector/dptos"),
             return_exceptions=True
         )
+
+        mef_info: Dict[str, Any] = {}
+        if isinstance(r_mef_js, httpx.Response) and r_mef_js.status_code == 200:
+            txt_mef = r_mef_js.text
+            mef_info["size_bytes"] = len(txt_mef)
+            mef_info["uuids_resource_id"] = list(set(re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', txt_mef, re.I)))
+            mef_info["urls_mef"] = list(set(re.findall(r'https?://[a-zA-Z0-9\.\-_/\?:=&]+', txt_mef)))
+            # Extraer todas las rutas de API o endpoints del backend de datosabiertos.mef.gob.pe
+            mef_info["endpoints_backend_mef"] = list(set(re.findall(r'["\']([a-zA-Z0-9_\-/]*(?:api|DatosAbiertos|dataset|resource|package|search|categoria|recurso|inversion|seace)[a-zA-Z0-9_\-/\?=&]*)["\']', txt_mef, re.I)))[:60]
+
+        cuaderno_rutas: Dict[str, Any] = {}
+        if isinstance(r_cuaderno_js, httpx.Response) and r_cuaderno_js.status_code == 200:
+            txt_c = r_cuaderno_js.text
+            # Extraer cómo se usan las variables soec-bus, soec-codi y soec-cons dentro del código
+            contextos_soec = re.findall(r'.{0,60}(?:soec-bus|soec-codi|soec-cons|urlEndPoint|buscador|cuaderno).{0,120}', txt_c)
+            cuaderno_rutas["fragmentos_codigo_soec"] = contextos_soec[:45]
+
+        oece_status = {}
+        if isinstance(r_oece_test, httpx.Response):
+            oece_status = {
+                "status": r_oece_test.status_code,
+                "muestra": r_oece_test.text[:300]
+            }
+        else:
+            oece_status = {"error": str(r_oece_test)}
+
         return {
-            "1_cuaderno_obra_js_interno": cuaderno_js,
-            "2_fup_proveedor_js_interno": fup_js,
-            "3_portal_datosabiertos_mef_estructura": mef_web
+            "1_mef_main_js_extraido": mef_info,
+            "2_eap_oece_gob_pe_accesible_desde_render": oece_status,
+            "3_fragmentos_endpoints_cuaderno_obra": cuaderno_rutas
         }
 
 
@@ -288,7 +264,7 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.8.1 - SSI Estable + Extractor Profundo",
+        "servicio": "DatePublic API v4.8.2 - SSI Estable + Extractor MEF/OECE",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",

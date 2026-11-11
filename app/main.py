@@ -2,14 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
-import re
-from bs4 import BeautifulSoup
+import urllib.parse
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana: SSI-MEF + Motor Multi-Vía SEACE (JSF 3-Pasos + APIs Abiertas)",
-    version="4.5.0"
+    description="API de Veeduría Ciudadana con Bypass de Firewall 403 para SEACE y Datos Abiertos MEF",
+    version="4.6.0"
 )
 
 app.add_middleware(
@@ -30,7 +29,7 @@ DETECTED_COLUMNS_CACHE: List[str] = []
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "es-PE,es;q=0.9,en;q=0.8"
 }
 
@@ -128,192 +127,186 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: MOTOR SEACE MULTI-VÍA (STATEFUL JSF + CKAN/OSCE)
+# MÓDULO 2: BYPASS 403 SEACE (PUENTES ABIERTOS + OCDS OSCE + CKAN MEF)
 # =========================================================
-def extraer_html_de_respuesta_jsf(raw_text: str) -> str:
-    bloques_cdata = re.findall(r"<!\[CDATA\[(.*?)\]\]>", raw_text, flags=re.DOTALL)
-    if bloques_cdata:
-        return "\n".join(bloques_cdata)
-    return raw_text
+def normalizar_proceso_seace(item: Dict[str, Any], reg_mef: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convierte cualquier registro de proceso/contrato proveniente del puente SSI-SEACE o API OSCE
+    al formato limpio de las 6 columnas de la tabla SEACE.
+    """
+    entidad = (
+        item.get("NOM_ENTIDAD") or item.get("ENTIDAD") or item.get("entidad")
+        or item.get("buyer", {}).get("name")
+        or reg_mef.get("NOMBRE_UEI") or reg_mef.get("ENTIDAD", "")
+    )
+    fecha = (
+        item.get("FEC_PUBLICACION") or item.get("FECHA_CONVOCATORIA") or item.get("FEC_SUSCRIPCION")
+        or item.get("fecha_publicacion") or item.get("date") or ""
+    )
+    nomenclatura = (
+        item.get("NOMENCLATURA") or item.get("DES_PROCESO") or item.get("NUM_CONTRATO")
+        or item.get("nomenclatura") or item.get("title") or ""
+    )
+    objeto = (
+        item.get("OBJETO") or item.get("DES_OBJETO_CONTRATACION") or item.get("TIPO_OBJETO")
+        or item.get("objeto") or "Obra / Consultoría"
+    )
+    descripcion = (
+        item.get("DESCRIPCION") or item.get("DES_PROCESO_OBJETO") or item.get("DES_CONTRATO")
+        or item.get("description") or reg_mef.get("NOMBRE_INVERSION", "")
+    )
+    monto_raw = (
+        item.get("MONTO_REFERENCIAL") or item.get("VR_VE_CUANTIA") or item.get("MONTO_CONTRATADO")
+        or item.get("MONTO_ADJUDICADO") or item.get("monto") or 0
+    )
+    monto_num = a_float(monto_raw)
+    moneda = item.get("MONEDA") or item.get("moneda") or "Soles"
+    contratista = item.get("CONTRATISTA") or item.get("NOM_CONTRATISTA") or item.get("RUC_CONTRATISTA") or None
+
+    fila = {
+        "1_entidad": str(entidad).strip(),
+        "2_fecha_publicacion": str(fecha).strip(),
+        "3_nomenclatura": str(nomenclatura).strip(),
+        "4_objeto_contratacion": str(objeto).strip(),
+        "5_descripcion_objeto": str(descripcion).strip(),
+        "6_valor_referencial_cuantia": formatear_soles(monto_num) if monto_num > 0 else str(monto_raw),
+        "moneda": moneda
+    }
+    if contratista:
+        fila["7_contratista_ganador"] = str(contratista).strip()
+    return fila
 
 
-def extraer_viewstate(raw_text: str, current_vs: str = "") -> str:
-    vs_xml = re.search(r'id="[^"]*ViewState[^"]*"[^>]*>\s*<!\[CDATA\[(.*?)\]\]>', raw_text)
-    if vs_xml:
-        return vs_xml.group(1)
-    soup = BeautifulSoup(raw_text, "lxml")
-    vs_inp = soup.find("input", {"name": re.compile(r"ViewState", re.I)})
-    if vs_inp and vs_inp.get("value"):
-        return vs_inp["value"]
-    return current_vs
+async def consultar_seace_multi_via(
+    client: httpx.AsyncClient,
+    cui: str,
+    reg_mef: Dict[str, Any],
+    debug_seace: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Evita el bloqueo HTTP 403 de prod2.seace.gob.pe consultando en paralelo:
+    1. Relays públicos (allorigins / codetabs) hacia los endpoints JSON de SEACE-SSI y OSCE.
+    2. API Abierta de Contrataciones del OSCE (CONOSCE / OCDS).
+    3. Recursos complementarios en api.datosabiertos.mef.gob.pe.
+    """
+    procedimientos: List[Dict[str, Any]] = []
+    fuente_exitosa = None
 
+    # URLs internas que contienen los procesos SEACE de un CUI en JSON
+    urls_json_objetivo = [
+        f"https://ofi5.mef.gob.pe/inviertews/Dashboard/traeDetInvSEACE?id={cui}&tipo=CUI",
+        f"https://ofi5.mef.gob.pe/inviertews/Dashboard/traeListaSeaceSSI?id={cui}&tipo=CUI",
+        f"https://contratacionesabiertas.osce.gob.pe/api/v1/releases?q={cui}&page=1",
+    ]
 
-def parsear_filas_reales_seace(raw_response_text: str) -> List[Dict[str, Any]]:
-    html_limpio = extraer_html_de_respuesta_jsf(raw_response_text)
-    soup = BeautifulSoup(html_limpio, "lxml")
-    resultados = []
+    # Construir peticiones directas + peticiones vía Relay para saltar el Geo-Fencing (HTTP 403)
+    tareas = []
+    etiquetas = []
 
-    for tr in soup.find_all("tr"):
-        celdas = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if len(celdas) >= 11 and celdas[0].isdigit() and "/" in celdas[2] and "-" in celdas[3]:
-            cuantia = celdas[9]
-            moneda = celdas[10]
-            resultados.append({
-                "1_entidad": celdas[1],
-                "2_fecha_publicacion": celdas[2],
-                "3_nomenclatura": celdas[3],
-                "4_objeto_contratacion": celdas[5],
-                "5_descripcion_objeto": celdas[6],
-                "6_valor_referencial_cuantia": f"S/ {cuantia}" if "Sol" in moneda else f"{cuantia} {moneda}",
-                "moneda": moneda,
-                "version_seace": celdas[11] if len(celdas) > 11 else "3"
-            })
-    return resultados
+    for u in urls_json_objetivo:
+        encoded_u = urllib.parse.quote(u, safe="")
+        # Vía Relay 1: AllOrigins Raw
+        tareas.append(client.get(f"https://api.allorigins.win/raw?url={encoded_u}", timeout=10.0))
+        etiquetas.append(f"allorigins_{u.split('/')[-1].split('?')[0]}")
+        # Vía Relay 2: CodeTabs Proxy
+        tareas.append(client.get(f"https://api.codetabs.com/v1/proxy?quest={encoded_u}", timeout=10.0))
+        etiquetas.append(f"codetabs_{u.split('/')[-1].split('?')[0]}")
 
+    # Además, probar si el endpoint SSI-SEACE responde por POST vía Jina
+    tareas.append(
+        client.get(
+            f"https://r.jina.ai/https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
+            headers={"Accept": "application/json"},
+            timeout=10.0
+        )
+    )
+    etiquetas.append("jina_ssi_page")
 
-def obtener_anios_busqueda(reg_mef: Dict[str, Any]) -> List[str]:
-    anios = []
-    for k in ["FEC_INI_EJECUCION", "FECHA_VIABILIDAD", "FECHA_REGISTRO", "FEC_INI_EJEC_FISICA"]:
-        val = str(reg_mef.get(k, "")).strip()
-        if len(val) >= 4 and val[:4].isdigit():
-            y = int(val[:4])
-            for cand in [str(y), str(y + 1), str(y - 1)]:
-                if 2015 <= int(cand) <= 2026 and cand not in anios:
-                    anios.append(cand)
-    if not anios:
-        anios = ["2026", "2025", "2024", "2023", "2022", "2021", "2020"]
-    return anios[:4]
+    respuestas = await asyncio.gather(*tareas, return_exceptions=True)
 
+    for tag, resp in zip(etiquetas, respuestas):
+        if isinstance(resp, Exception):
+            debug_seace[tag] = f"ERR: {type(resp).__name__}"
+            continue
 
-async def extraer_tabla_seace_real(cui: str, reg_mef: Dict[str, Any], debug_seace: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if debug_seace is None:
-        debug_seace = {}
-
-    anios_a_probar = obtener_anios_busqueda(reg_mef)
-    debug_seace["anios_probados"] = anios_a_probar
-    procedimientos_encontrados: List[Dict[str, Any]] = []
-    anio_exitoso = None
-
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=16.0) as client:
-            # PASO 1: GET inicial a buscadorPublico.xhtml
-            r_get = await client.get(SEACE_URL)
-            debug_seace["1_get_inicial_status"] = r_get.status_code
-            debug_seace["cookies_sesion"] = dict(client.cookies)
-
-            if r_get.status_code == 200:
-                vs = extraer_viewstate(r_get.text)
-                debug_seace["viewstate_inicial_ok"] = bool(vs)
-
-                headers_ajax = {
-                    **HEADERS,
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Faces-Request": "partial/ajax",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": "https://prod2.seace.gob.pe",
-                    "Referer": SEACE_URL
-                }
-
-                # PASO 2: Cambiar en el servidor JSF de la Pestaña 0 ("Anuncio Futura") a la Pestaña 1 ("Procedimientos de Selección")
-                payload_tab = {
-                    "javax.faces.partial.ajax": "true",
-                    "javax.faces.source": "tbBuscador",
-                    "javax.faces.partial.execute": "tbBuscador",
-                    "javax.faces.partial.render": "tbBuscador",
-                    "javax.faces.behavior.event": "tabChange",
-                    "javax.faces.partial.event": "tabChange",
-                    "tbBuscador_newTab": "tbBuscador:idTab2",
-                    "tbBuscador_tabindex": "1",
-                    "tbBuscador_activeIndex": "1",
-                    "javax.faces.ViewState": vs
-                }
-                r_tab = await client.post(SEACE_URL, data=payload_tab, headers=headers_ajax)
-                debug_seace["2_cambio_pestana_status"] = r_tab.status_code
-                if r_tab.status_code == 200:
-                    vs = extraer_viewstate(r_tab.text, vs)
-
-                # Inspeccionar todos los inputs disponibles después del cambio de pestaña
-                html_activo = extraer_html_de_respuesta_jsf(r_tab.text) if r_tab.status_code == 200 else r_get.text
-                soup_activo = BeautifulSoup(html_activo + "\n" + r_get.text, "lxml")
-
-                inputs_detectados = [
-                    inp.get("name") or inp.get("id")
-                    for inp in soup_activo.find_all(["input", "select", "button", "a"])
-                    if (inp.get("name") or inp.get("id")) and "tbBuscador" in (inp.get("name") or inp.get("id") or "")
-                ]
-                debug_seace["inputs_tbbuscador_detectados"] = inputs_detectados[:35]
-
-                # Identificar exactamente los IDs de la pestaña de Procedimientos de Selección
-                id_form = "tbBuscador:idFormBuscarProceso"
-                id_cui = "tbBuscador:idFormBuscarProceso:txtCodigoUnico"
-                id_anio = "tbBuscador:idFormBuscarProceso:anioConvocatoria_input"
-                id_version = "tbBuscador:idFormBuscarProceso:versionSeace_input"
-                id_btn = "tbBuscador:idFormBuscarProceso:btnBuscarSelToken"
-
-                for item_id in inputs_detectados:
-                    low = item_id.lower()
-                    if "codigounico" in low:
-                        id_cui = item_id
-                    elif "anioconvocatoria_input" in low:
-                        id_anio = item_id
-                    elif "btnbuscarsel" in low:
-                        id_btn = item_id
-
-                debug_seace["ids_usados_en_post"] = {
-                    "form": id_form,
-                    "cui": id_cui,
-                    "anio": id_anio,
-                    "btn": id_btn
-                }
-
-                # PASO 3: Enviar la búsqueda del CUI en la Pestaña 1 para cada año candidato
-                for anio in anios_a_probar:
-                    payload_search = {
-                        "javax.faces.partial.ajax": "true",
-                        "javax.faces.source": id_btn,
-                        "javax.faces.partial.execute": id_form,
-                        "javax.faces.partial.render": f"{id_form}:dtProcesos {id_form}:pnlMsj",
-                        id_btn: id_btn,
-                        id_form: id_form,
-                        f"{id_form}:txtNombreEntidad": "",
-                        f"{id_form}:idObjetoContratacion_input": "",
-                        f"{id_form}:descripcionObjeto": "",
-                        id_version: "3",
-                        id_anio: anio,
-                        id_cui: cui,
-                        f"{id_form}:codigoSnip": "",
-                        "tbBuscador_activeIndex": "1",
-                        "javax.faces.ViewState": vs
-                    }
-
-                    r_post = await client.post(SEACE_URL, data=payload_search, headers=headers_ajax)
-                    debug_seace[f"3_post_{anio}_status"] = r_post.status_code
-                    debug_seace[f"3_post_{anio}_len"] = len(r_post.text)
-
-                    if r_post.status_code == 200:
-                        vs = extraer_viewstate(r_post.text, vs)
-                        if anio == anios_a_probar[0]:
-                            debug_seace["muestra_respuesta_xml_seace"] = r_post.text[:600]
-
-                        filas = parsear_filas_reales_seace(r_post.text)
-                        if filas:
-                            procedimientos_encontrados.extend(filas)
-                            anio_exitoso = anio
+        debug_seace[tag] = {"status": resp.status_code, "len": len(resp.text)}
+        if resp.status_code == 200 and len(resp.text) > 5:
+            try:
+                data = resp.json()
+                # Si es una lista directa de procesos SEACE del MEF
+                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                    for item in data:
+                        procedimientos.append(normalizar_proceso_seace(item, reg_mef))
+                    fuente_exitosa = tag
+                    break
+                # Si es respuesta de Contrataciones Abiertas del OSCE (OCDS)
+                if isinstance(data, dict):
+                    releases = data.get("releases") or data.get("records") or data.get("data") or []
+                    if isinstance(releases, list) and len(releases) > 0:
+                        for rel in releases:
+                            if isinstance(rel, dict) and cui in str(rel):
+                                tender = rel.get("tender", {})
+                                item_ocds = {
+                                    "NOM_ENTIDAD": rel.get("buyer", {}).get("name"),
+                                    "FEC_PUBLICACION": tender.get("tenderPeriod", {}).get("startDate") or rel.get("date"),
+                                    "NOMENCLATURA": tender.get("title") or tender.get("id"),
+                                    "OBJETO": tender.get("mainProcurementCategory"),
+                                    "DESCRIPCION": tender.get("description"),
+                                    "MONTO_REFERENCIAL": tender.get("value", {}).get("amount"),
+                                    "MONEDA": tender.get("value", {}).get("currency", "Soles")
+                                }
+                                procedimientos.append(normalizar_proceso_seace(item_ocds, reg_mef))
+                        if procedimientos:
+                            fuente_exitosa = tag
                             break
-    except Exception as e:
-        debug_seace["seace_exception"] = f"{type(e).__name__}: {str(e)}"
+            except Exception:
+                continue
 
     return {
         "cui": cui,
         "portal_seace": SEACE_URL,
-        "anio_convocatoria_encontrado": anio_exitoso,
-        "total_procedimientos": len(procedimientos_encontrados),
-        "procedimientos_seace": procedimientos_encontrados
+        "fuente_extraccion": fuente_exitosa or "BLOQUEO_WAF_403_SEACE_SIN_DATOS_PUBLICOS",
+        "total_procedimientos": len(procedimientos),
+        "procedimientos_seace": procedimientos
     }
 
 
 # =========================================================
-# MÓDULO 3: MOTOR DE BÚSQUEDA CKAN MEF (INTACTO)
+# MÓDULO 3: DESCUBRIDOR DE TODOS LOS DATASETS EN API.DATOSABIERTOS.MEF.GOB.PE
+# =========================================================
+@app.get("/api/v1/catalogo-mef")
+async def explorar_todos_los_datasets_del_mef():
+    """
+    Lista todos los paquetes y resource_id disponibles dentro de api.datosabiertos.mef.gob.pe
+    (que no tiene bloqueo 403 desde Render) para ver qué tablas adicionales de SEACE/Contratos/F12B existen.
+    """
+    resultados = {}
+    endpoints_catalogo = [
+        f"{CKAN_BASE}/package_list",
+        f"{CKAN_BASE}/package_search?q=seace",
+        f"{CKAN_BASE}/package_search?q=inversion",
+        f"{CKAN_BASE}/package_search?q=contrato",
+        f"{CKAN_BASE}/current_package_list_with_resources?limit=50"
+    ]
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, timeout=15.0) as client:
+        resps = await asyncio.gather(
+            *[client.get(u) for u in endpoints_catalogo],
+            return_exceptions=True
+        )
+        for u, r in zip(endpoints_catalogo, resps):
+            nombre = u.split("/")[-1]
+            if isinstance(r, httpx.Response):
+                try:
+                    resultados[nombre] = {"status": r.status_code, "body": r.json()}
+                except Exception:
+                    resultados[nombre] = {"status": r.status_code, "text": r.text[:300]}
+            else:
+                resultados[nombre] = {"error": str(r)}
+    return resultados
+
+
+# =========================================================
+# MÓDULO 4: MOTOR DE BÚSQUEDA CKAN MEF (INTACTO)
 # =========================================================
 def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
     if isinstance(raw_json, list):
@@ -406,30 +399,27 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.5 - Diagnóstico y Extracción SEACE",
+        "servicio": "DatePublic API v4.6 - Bypass 403 SEACE + Catálogo MEF",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
             "resumen_seace": "/api/v1/obra/{cui}/resumen-seace",
-            "debug_seace": "/api/v1/debug-seace/{cui}"
+            "debug_seace": "/api/v1/debug-seace/{cui}",
+            "explorar_catalogo_mef": "/api/v1/catalogo-mef"
         }
     }
 
 
 @app.get("/api/v1/debug-seace/{cui}")
 async def diagnosticar_scraper_seace(cui: str):
-    """
-    Ejecuta el flujo de 3 pasos sobre SEACE y devuelve los IDs exactos del formulario
-    y el XML crudo que responde prod2.seace.gob.pe.
-    """
     debug_log: Dict[str, Any] = {}
     debug_seace: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
         reg = await buscar_cui_en_mef(client, cui.strip(), debug_log)
-        resultado_seace = await extraer_tabla_seace_real(cui.strip(), reg or {}, debug_seace)
+        resultado_seace = await consultar_seace_multi_via(client, cui.strip(), reg or {}, debug_seace)
         return {
             "resultado_seace": resultado_seace,
-            "diagnostico_conexion_seace": debug_seace
+            "diagnostico_bypass_403": debug_seace
         }
 
 
@@ -446,13 +436,14 @@ async def consultar_obra_cui(cui: str):
         return CUI_MEMORY_CACHE[cui_clean]
 
     debug_log: Dict[str, Any] = {}
+    debug_seace: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
         registro = await buscar_cui_en_mef(client, cui_clean, debug_log)
         if not registro:
             raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} no se encontró.")
 
         resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, registro)
-        resumen_seace = await extraer_tabla_seace_real(cui_clean, registro)
+        resumen_seace = await consultar_seace_multi_via(client, cui_clean, registro, debug_seace)
 
         respuesta = {
             "cui": cui_clean,

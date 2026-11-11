@@ -2,13 +2,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
-import urllib.parse
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana con Bypass de Firewall 403 para SEACE y Datos Abiertos MEF",
-    version="4.6.0"
+    description="API de Veeduría Ciudadana de Alta Velocidad (SSI-MEF + Detector de Fuentes sin Geo-Fencing)",
+    version="4.7.0"
 )
 
 app.add_middleware(
@@ -22,15 +21,13 @@ app.add_middleware(
 CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
 CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
 PRIMARY_RESOURCE_ID = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"
-SEACE_URL = "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml"
 
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
 DETECTED_COLUMNS_CACHE: List[str] = []
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "es-PE,es;q=0.9,en;q=0.8"
+    "Accept": "application/json, text/plain, */*"
 }
 
 
@@ -61,7 +58,7 @@ def formatear_fecha_corta(fecha_str: Any) -> str:
 
 
 # =========================================================
-# MÓDULO 1: SSI - MEF (LOS 5 DATOS CLAVE)
+# MÓDULO 1: SSI - MEF (LOS 5 DATOS CLAVE - RESPUESTA < 1 SEGUNDO)
 # =========================================================
 def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[str, Any]:
     costo_actualizado_a = a_float(fuente.get("COSTO_ACTUALIZADO"))
@@ -127,186 +124,46 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: BYPASS 403 SEACE (PUENTES ABIERTOS + OCDS OSCE + CKAN MEF)
+# MÓDULO 2: DETECTOR DE PORTALES PERUANOS ABIERTOS DESDE RENDER (EE. UU.)
 # =========================================================
-def normalizar_proceso_seace(item: Dict[str, Any], reg_mef: Dict[str, Any]) -> Dict[str, Any]:
+@app.get("/api/v1/probar-fuentes-peruanas/{cui}")
+async def probar_que_portales_no_bloquean_render(cui: str):
     """
-    Convierte cualquier registro de proceso/contrato proveniente del puente SSI-SEACE o API OSCE
-    al formato limpio de las 6 columnas de la tabla SEACE.
+    Prueba en paralelo cuáles portales y APIs del Estado Peruano responden HTTP 200
+    desde Render (EE. UU.) sin bloqueo 403 ni Geo-Fencing.
     """
-    entidad = (
-        item.get("NOM_ENTIDAD") or item.get("ENTIDAD") or item.get("entidad")
-        or item.get("buyer", {}).get("name")
-        or reg_mef.get("NOMBRE_UEI") or reg_mef.get("ENTIDAD", "")
-    )
-    fecha = (
-        item.get("FEC_PUBLICACION") or item.get("FECHA_CONVOCATORIA") or item.get("FEC_SUSCRIPCION")
-        or item.get("fecha_publicacion") or item.get("date") or ""
-    )
-    nomenclatura = (
-        item.get("NOMENCLATURA") or item.get("DES_PROCESO") or item.get("NUM_CONTRATO")
-        or item.get("nomenclatura") or item.get("title") or ""
-    )
-    objeto = (
-        item.get("OBJETO") or item.get("DES_OBJETO_CONTRATACION") or item.get("TIPO_OBJETO")
-        or item.get("objeto") or "Obra / Consultoría"
-    )
-    descripcion = (
-        item.get("DESCRIPCION") or item.get("DES_PROCESO_OBJETO") or item.get("DES_CONTRATO")
-        or item.get("description") or reg_mef.get("NOMBRE_INVERSION", "")
-    )
-    monto_raw = (
-        item.get("MONTO_REFERENCIAL") or item.get("VR_VE_CUANTIA") or item.get("MONTO_CONTRATADO")
-        or item.get("MONTO_ADJUDICADO") or item.get("monto") or 0
-    )
-    monto_num = a_float(monto_raw)
-    moneda = item.get("MONEDA") or item.get("moneda") or "Soles"
-    contratista = item.get("CONTRATISTA") or item.get("NOM_CONTRATISTA") or item.get("RUC_CONTRATISTA") or None
-
-    fila = {
-        "1_entidad": str(entidad).strip(),
-        "2_fecha_publicacion": str(fecha).strip(),
-        "3_nomenclatura": str(nomenclatura).strip(),
-        "4_objeto_contratacion": str(objeto).strip(),
-        "5_descripcion_objeto": str(descripcion).strip(),
-        "6_valor_referencial_cuantia": formatear_soles(monto_num) if monto_num > 0 else str(monto_raw),
-        "moneda": moneda
-    }
-    if contratista:
-        fila["7_contratista_ganador"] = str(contratista).strip()
-    return fila
-
-
-async def consultar_seace_multi_via(
-    client: httpx.AsyncClient,
-    cui: str,
-    reg_mef: Dict[str, Any],
-    debug_seace: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Evita el bloqueo HTTP 403 de prod2.seace.gob.pe consultando en paralelo:
-    1. Relays públicos (allorigins / codetabs) hacia los endpoints JSON de SEACE-SSI y OSCE.
-    2. API Abierta de Contrataciones del OSCE (CONOSCE / OCDS).
-    3. Recursos complementarios en api.datosabiertos.mef.gob.pe.
-    """
-    procedimientos: List[Dict[str, Any]] = []
-    fuente_exitosa = None
-
-    # URLs internas que contienen los procesos SEACE de un CUI en JSON
-    urls_json_objetivo = [
-        f"https://ofi5.mef.gob.pe/inviertews/Dashboard/traeDetInvSEACE?id={cui}&tipo=CUI",
-        f"https://ofi5.mef.gob.pe/inviertews/Dashboard/traeListaSeaceSSI?id={cui}&tipo=CUI",
-        f"https://contratacionesabiertas.osce.gob.pe/api/v1/releases?q={cui}&page=1",
-    ]
-
-    # Construir peticiones directas + peticiones vía Relay para saltar el Geo-Fencing (HTTP 403)
-    tareas = []
-    etiquetas = []
-
-    for u in urls_json_objetivo:
-        encoded_u = urllib.parse.quote(u, safe="")
-        # Vía Relay 1: AllOrigins Raw
-        tareas.append(client.get(f"https://api.allorigins.win/raw?url={encoded_u}", timeout=10.0))
-        etiquetas.append(f"allorigins_{u.split('/')[-1].split('?')[0]}")
-        # Vía Relay 2: CodeTabs Proxy
-        tareas.append(client.get(f"https://api.codetabs.com/v1/proxy?quest={encoded_u}", timeout=10.0))
-        etiquetas.append(f"codetabs_{u.split('/')[-1].split('?')[0]}")
-
-    # Además, probar si el endpoint SSI-SEACE responde por POST vía Jina
-    tareas.append(
-        client.get(
-            f"https://r.jina.ai/https://ofi5.mef.gob.pe/ssi/?codigo={cui}",
-            headers={"Accept": "application/json"},
-            timeout=10.0
-        )
-    )
-    etiquetas.append("jina_ssi_page")
-
-    respuestas = await asyncio.gather(*tareas, return_exceptions=True)
-
-    for tag, resp in zip(etiquetas, respuestas):
-        if isinstance(resp, Exception):
-            debug_seace[tag] = f"ERR: {type(resp).__name__}"
-            continue
-
-        debug_seace[tag] = {"status": resp.status_code, "len": len(resp.text)}
-        if resp.status_code == 200 and len(resp.text) > 5:
-            try:
-                data = resp.json()
-                # Si es una lista directa de procesos SEACE del MEF
-                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                    for item in data:
-                        procedimientos.append(normalizar_proceso_seace(item, reg_mef))
-                    fuente_exitosa = tag
-                    break
-                # Si es respuesta de Contrataciones Abiertas del OSCE (OCDS)
-                if isinstance(data, dict):
-                    releases = data.get("releases") or data.get("records") or data.get("data") or []
-                    if isinstance(releases, list) and len(releases) > 0:
-                        for rel in releases:
-                            if isinstance(rel, dict) and cui in str(rel):
-                                tender = rel.get("tender", {})
-                                item_ocds = {
-                                    "NOM_ENTIDAD": rel.get("buyer", {}).get("name"),
-                                    "FEC_PUBLICACION": tender.get("tenderPeriod", {}).get("startDate") or rel.get("date"),
-                                    "NOMENCLATURA": tender.get("title") or tender.get("id"),
-                                    "OBJETO": tender.get("mainProcurementCategory"),
-                                    "DESCRIPCION": tender.get("description"),
-                                    "MONTO_REFERENCIAL": tender.get("value", {}).get("amount"),
-                                    "MONEDA": tender.get("value", {}).get("currency", "Soles")
-                                }
-                                procedimientos.append(normalizar_proceso_seace(item_ocds, reg_mef))
-                        if procedimientos:
-                            fuente_exitosa = tag
-                            break
-            except Exception:
-                continue
-
-    return {
-        "cui": cui,
-        "portal_seace": SEACE_URL,
-        "fuente_extraccion": fuente_exitosa or "BLOQUEO_WAF_403_SEACE_SIN_DATOS_PUBLICOS",
-        "total_procedimientos": len(procedimientos),
-        "procedimientos_seace": procedimientos
+    fuentes_a_probar = {
+        "1_mef_datos_abiertos_ckan": f"{CKAN_SEARCH}?resource_id={PRIMARY_RESOURCE_ID}&q={cui}&limit=1",
+        "2_mef_sql_endpoint": f"{CKAN_BASE}/datastore_search_sql?sql=SELECT%20*%20FROM%20%22{PRIMARY_RESOURCE_ID}%22%20LIMIT%201",
+        "3_pcm_datos_abiertos_nacional": f"https://www.datosabiertos.gob.pe/api/3/action/package_search?q={cui}",
+        "4_pcm_catalogo_seace": "https://www.datosabiertos.gob.pe/api/3/action/package_search?q=seace",
+        "5_pcm_catalogo_infobras": "https://www.datosabiertos.gob.pe/api/3/action/package_search?q=infobras",
+        "6_osce_perfil_proveedor_fup": "https://apps.oece.gob.pe/perfilprov-ui/",
+        "7_osce_cuaderno_obra": "https://apps.osce.gob.pe/buscador-cuaderno-obra/search",
+        "8_cgr_buscador_informes": "https://appbp.contraloria.gob.pe/BuscadorCGR/Informes/Avanzado.html",
+        "9_infobras_web": "https://infobras.contraloria.gob.pe/infobrasweb"
     }
 
+    reporte = {}
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=6.0) as client:
+        tareas = [client.get(url) for url in fuentes_a_probar.values()]
+        respuestas = await asyncio.gather(*tareas, return_exceptions=True)
 
-# =========================================================
-# MÓDULO 3: DESCUBRIDOR DE TODOS LOS DATASETS EN API.DATOSABIERTOS.MEF.GOB.PE
-# =========================================================
-@app.get("/api/v1/catalogo-mef")
-async def explorar_todos_los_datasets_del_mef():
-    """
-    Lista todos los paquetes y resource_id disponibles dentro de api.datosabiertos.mef.gob.pe
-    (que no tiene bloqueo 403 desde Render) para ver qué tablas adicionales de SEACE/Contratos/F12B existen.
-    """
-    resultados = {}
-    endpoints_catalogo = [
-        f"{CKAN_BASE}/package_list",
-        f"{CKAN_BASE}/package_search?q=seace",
-        f"{CKAN_BASE}/package_search?q=inversion",
-        f"{CKAN_BASE}/package_search?q=contrato",
-        f"{CKAN_BASE}/current_package_list_with_resources?limit=50"
-    ]
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, timeout=15.0) as client:
-        resps = await asyncio.gather(
-            *[client.get(u) for u in endpoints_catalogo],
-            return_exceptions=True
-        )
-        for u, r in zip(endpoints_catalogo, resps):
-            nombre = u.split("/")[-1]
-            if isinstance(r, httpx.Response):
-                try:
-                    resultados[nombre] = {"status": r.status_code, "body": r.json()}
-                except Exception:
-                    resultados[nombre] = {"status": r.status_code, "text": r.text[:300]}
+        for nombre, resp in zip(fuentes_a_probar.keys(), respuestas):
+            if isinstance(resp, Exception):
+                reporte[nombre] = {"accesible_desde_render": False, "error": type(resp).__name__}
             else:
-                resultados[nombre] = {"error": str(r)}
-    return resultados
+                reporte[nombre] = {
+                    "accesible_desde_render": resp.status_code == 200,
+                    "http_status": resp.status_code,
+                    "tamano_respuesta": len(resp.text),
+                    "muestra": resp.text[:250] if resp.status_code == 200 else None
+                }
+    return reporte
 
 
 # =========================================================
-# MÓDULO 4: MOTOR DE BÚSQUEDA CKAN MEF (INTACTO)
+# MÓDULO 3: MOTOR DE BÚSQUEDA CKAN MEF (INTACTO)
 # =========================================================
 def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
     if isinstance(raw_json, list):
@@ -399,28 +256,13 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.6 - Bypass 403 SEACE + Catálogo MEF",
+        "servicio": "DatePublic API v4.7 - Producción Estable + Radar de Portales",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
-            "resumen_seace": "/api/v1/obra/{cui}/resumen-seace",
-            "debug_seace": "/api/v1/debug-seace/{cui}",
-            "explorar_catalogo_mef": "/api/v1/catalogo-mef"
+            "probar_fuentes_peruanas": "/api/v1/probar-fuentes-peruanas/{cui}"
         }
     }
-
-
-@app.get("/api/v1/debug-seace/{cui}")
-async def diagnosticar_scraper_seace(cui: str):
-    debug_log: Dict[str, Any] = {}
-    debug_seace: Dict[str, Any] = {}
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        reg = await buscar_cui_en_mef(client, cui.strip(), debug_log)
-        resultado_seace = await consultar_seace_multi_via(client, cui.strip(), reg or {}, debug_seace)
-        return {
-            "resultado_seace": resultado_seace,
-            "diagnostico_bypass_403": debug_seace
-        }
 
 
 @app.get("/api/v1/obra/{cui}")
@@ -436,21 +278,30 @@ async def consultar_obra_cui(cui: str):
         return CUI_MEMORY_CACHE[cui_clean]
 
     debug_log: Dict[str, Any] = {}
-    debug_seace: Dict[str, Any] = {}
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
         registro = await buscar_cui_en_mef(client, cui_clean, debug_log)
         if not registro:
             raise HTTPException(status_code=404, detail=f"El CUI {cui_clean} no se encontró.")
 
         resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, registro)
-        resumen_seace = await consultar_seace_multi_via(client, cui_clean, registro, debug_seace)
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
+            "fuente": "API_DATOS_ABIERTOS_MEF + SSI_INVIERTE_PE",
             "resumen_ssi_5_datos_clave": resumen_ssi,
-            "resumen_seace": resumen_seace,
-            "datos_proyecto": registro
+            "datos_proyecto": registro,
+            "enlaces_ecosistema": {
+                "ssi_mef": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui_clean}",
+                "ficha_invierte": f"https://ofi5.mef.gob.pe/invierte/ejecucion/verFichaEjecucion/{cui_clean}",
+                "seace": "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml",
+                "infobras": "https://infobras.contraloria.gob.pe/infobrasweb",
+                "consulta_amigable": "https://apps5.mineco.gob.pe/transparencia/Navegador/default.aspx",
+                "informes_cgr": "https://appbp.contraloria.gob.pe/BuscadorCGR/Informes/Avanzado.html",
+                "fup_oece": "https://apps.oece.gob.pe/perfilprov-ui/",
+                "djic_cgr": "https://appdji.contraloria.gob.pe/djic/",
+                "cuaderno_obra": "https://apps.osce.gob.pe/buscador-cuaderno-obra/search"
+            }
         }
         CUI_MEMORY_CACHE[cui_clean] = respuesta
         return respuesta
@@ -460,9 +311,3 @@ async def consultar_obra_cui(cui: str):
 async def obtener_solo_5_datos_ssi(cui: str):
     data = await consultar_obra_cui(cui)
     return data["resumen_ssi_5_datos_clave"]
-
-
-@app.get("/api/v1/obra/{cui}/resumen-seace")
-async def obtener_solo_datos_seace(cui: str):
-    data = await consultar_obra_cui(cui)
-    return data["resumen_seace"]

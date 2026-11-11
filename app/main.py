@@ -2,12 +2,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
+import uuid
 from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana en Tiempo Real: SSI-MEF + Procesos de Selección SEACE (Datos Abiertos MEF)",
-    version="5.0.1"
+    description="API de Veeduría Ciudadana: SSI-MEF + Componentes Físicos F8 + Inspector de Tablas MEF",
+    version="5.0.2"
 )
 
 app.add_middleware(
@@ -20,12 +21,13 @@ app.add_middleware(
 
 CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
 CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
+MEF_REST_BASE = "https://datosabiertos.mef.gob.pe/Rest"
 
-# Resource IDs oficiales descubiertos en el Catálogo del MEF (Sin bloqueo 403 desde Render)
-RESOURCE_DETALLE_INV = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"       # DETALLE_INVERSIONES.csv (SSI)
-RESOURCE_PROCESOS_SEACE = "79e51378-613e-4886-9743-1426c064f8f1"    # PROCESO_SELECCION.csv (SEACE 2007-2026)
-RESOURCE_EXPEDIENTES_ET = "b782e8d4-cce5-45c8-8675-6959100aa360"    # INVERSIONES_ET.csv (Expedientes Técnicos)
+RESOURCE_DETALLE_INV = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"       # DETALLE_INVERSIONES.csv
+RESOURCE_COMPONENTES = "79e51378-613e-4886-9743-1426c064f8f1"       # Componentes Físicos de la Inversión
+RESOURCE_EXPEDIENTES_ET = "b782e8d4-cce5-45c8-8675-6959100aa360"    # INVERSIONES_ET.csv
 RESOURCE_ESTADO_SITUACIONAL = "2c20b8e2-7bd9-41ba-8239-8f8c9571935a" # ESTADO_SITUACIONAL.csv
+RESOURCE_FORMATO_12B = "c275fa9f-5c61-4313-828d-0827277bdd97"       # FORMATO_12B.csv
 
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
 DETECTED_COLUMNS_CACHE: Dict[str, List[str]] = {}
@@ -62,15 +64,8 @@ def formatear_fecha_corta(fecha_str: Any) -> str:
     return limpia
 
 
-def obtener_primer_valor(fila: Dict[str, Any], posibles_llaves: List[str], default: str = "No especificado") -> str:
-    for k in posibles_llaves:
-        if k in fila and fila[k] is not None and str(fila[k]).strip() != "":
-            return str(fila[k]).strip()
-    return default
-
-
 # =========================================================
-# MOTOR GENÉRICO DE CONSULTA CKAN MEF (PARA CUALQUIER RESOURCE_ID)
+# MOTOR GENÉRICO DE CONSULTA CKAN MEF
 # =========================================================
 def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[str, Any]]:
     if isinstance(raw_json, list):
@@ -121,7 +116,7 @@ async def buscar_filas_por_cui_en_recurso(
     client: httpx.AsyncClient,
     resource_id: str,
     cui: str,
-    limite: int = 25
+    limite: int = 30
 ) -> List[Dict[str, Any]]:
     if resource_id not in DETECTED_COLUMNS_CACHE:
         try:
@@ -233,50 +228,33 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: PROCESOS DE SELECCIÓN SEACE (TABLA OFICIAL PROCESO_SELECCION.csv)
+# MÓDULO 2: COMPONENTES Y METAS FÍSICAS VIGENTES (SIN FILAS EN CERO NI REPETIDAS)
 # =========================================================
-def estructurar_5_datos_seace(cui: str, filas_seace: List[Dict[str, Any]]) -> Dict[str, Any]:
-    procesos_limpios = []
+def estructurar_componentes_limpios(cui: str, filas_comp: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Filtrar solo componentes con costo > 0, priorizando la etapa 'Ejecución física (C)'
+    con_costo = [r for r in filas_comp if a_float(r.get("COSTO_INVERSION")) > 0]
+    ejecucion_c = [r for r in con_costo if "EJECUCI" in str(r.get("DES_ETAPA", "")).upper()]
+    seleccionadas = ejecucion_c if ejecucion_c else con_costo
 
-    for row in filas_seace:
-        entidad = obtener_primer_valor(row, ["ENTIDAD", "NOM_ENTIDAD", "NOMBRE_ENTIDAD", "UNIDAD_EJECUTORA", "NOMBRE_UEI"])
-        fecha_pub = formatear_fecha_corta(
-            obtener_primer_valor(row, ["FECHA_CONVOCATORIA", "FEC_CONVOCATORIA", "FECHA_PUBLICACION", "FEC_PUBLICACION", "FECHA_PROCESO", "FECHA_CONTRATO"], "")
-        )
-        nomenclatura = obtener_primer_valor(row, ["NOMENCLATURA", "DES_PROCESO", "PROCESO", "CODIGO_PROCESO", "NUM_PROCESO", "NUMERO_CONTRATO", "NRO_CONTRATO"])
-        objeto = obtener_primer_valor(row, ["OBJETO_CONTRATACION", "OBJETO", "TIPO_OBJETO", "DES_OBJETO", "COMPONENTE"])
-        descripcion = obtener_primer_valor(row, ["DESCRIPCION_PROCESO", "DESCRIPCION_OBJETO", "DESCRIPCION", "GLOSA_PROCESO", "NOMBRE_PROCESO", "NOMBRE_INVERSION"])
-        contratista = obtener_primer_valor(row, ["CONTRATISTA", "RAZON_SOCIAL", "NOM_CONTRATISTA", "PROVEEDOR", "GANADOR"], "")
-        ruc_contratista = obtener_primer_valor(row, ["RUC_CONTRATISTA", "RUC", "NUM_RUC", "RUC_PROVEEDOR"], "")
-        estado_proc = obtener_primer_valor(row, ["ESTADO_PROCESO", "ESTADO", "SITUACION_PROCESO", "ETAPA"], "")
+    componentes_limpios = []
+    for r in seleccionadas:
+        meta_cap = str(r.get("VAL_META_CAPAC", "")).strip()
+        um_cap = str(r.get("DES_UM_CAPAC", "")).strip()
+        meta_prod = str(r.get("VAL_META_PRODU", "")).strip()
+        um_prod = str(r.get("DES_UM_PRODU", "")).strip()
 
-        monto_val = 0.0
-        for col_m in ["MONTO_REFERENCIAL", "VALOR_REFERENCIAL", "MONTO_PROCESO", "MONTO_CONTRATADO", "MONTO_ADJUDICADO", "COSTO_COMPONENTE", "MONTO"]:
-            if col_m in row and a_float(row.get(col_m)) > 0:
-                monto_val = a_float(row.get(col_m))
-                break
-
-        item_limpio: Dict[str, Any] = {
-            "1_entidad_o_proceso": entidad if entidad != "No especificado" else nomenclatura,
-            "2_fecha_convocatoria": fecha_pub,
-            "3_nomenclatura_o_contrato": nomenclatura,
-            "4_objeto_y_descripcion": f"{objeto} - {descripcion}".strip(" -"),
-            "5_valor_referencial_o_monto": formatear_soles(monto_val) if monto_val > 0 else "Ver detalle crudo"
-        }
-        if contratista or ruc_contratista:
-            item_limpio["contratista_ganador"] = f"{ruc_contratista} - {contratista}".strip(" -")
-        if estado_proc:
-            item_limpio["estado"] = estado_proc
-
-        item_limpio["datos_oficiales_fila"] = row
-        procesos_limpios.append(item_limpio)
+        componentes_limpios.append({
+            "1_componente_producto": r.get("DES_PRODUCTO", "No especificado"),
+            "2_tipo_y_accion": f"{r.get('DES_TIPO_COMPONENTE', '')} - {r.get('DES_ACCION') or r.get('DES_OBSERVACIONES', '')}".strip(" -"),
+            "3_meta_fisica": f"{meta_cap} {um_cap}".strip() if meta_cap else f"{meta_prod} {um_prod}".strip(),
+            "4_etapa_y_periodo": f"{r.get('DES_ETAPA', '')} ({r.get('PERIODO', '')})".strip(" ()"),
+            "5_costo_componente": formatear_soles(a_float(r.get("COSTO_INVERSION")))
+        })
 
     return {
         "cui": cui,
-        "portal_seace": "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml",
-        "fuente_datos_abiertos": "PROCESO_SELECCION.csv (resource_id: 79e51378-613e-4886-9743-1426c064f8f1)",
-        "total_procedimientos": len(procesos_limpios),
-        "procedimientos_seace": procesos_limpios
+        "total_componentes_activos": len(componentes_limpios),
+        "componentes_obra": componentes_limpios
     }
 
 
@@ -286,30 +264,64 @@ def estructurar_5_datos_seace(cui: str, filas_seace: List[Dict[str, Any]]) -> Di
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v5.0.1 - SSI + SEACE Oficial (Datos Abiertos MEF)",
+        "servicio": "DatePublic API v5.0.2 - SSI + Componentes F8 + Inspector de Tablas MEF",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
-            "resumen_seace": "/api/v1/obra/{cui}/resumen-seace",
-            "ver_columnas_seace": "/api/v1/esquema-seace/{cui}"
+            "inspeccionar_todas_las_tablas_mef": "/api/v1/esquema-seace/{cui}"
         }
     }
 
 
 @app.get("/api/v1/esquema-seace/{cui}")
-async def inspeccionar_columnas_reales_proceso_seleccion(cui: str):
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        r_muestra, filas_cui = await asyncio.gather(
-            client.get(CKAN_SEARCH, params={"resource_id": RESOURCE_PROCESOS_SEACE, "limit": 2}, timeout=12.0),
-            buscar_filas_por_cui_en_recurso(client, RESOURCE_PROCESOS_SEACE, cui.strip())
+async def inspeccionar_todas_las_tablas_mef_para_cui(cui: str):
+    """
+    Revisa qué datos exactos existen para este CUI en:
+    - INVERSIONES_ET (Expedientes Técnicos)
+    - ESTADO_SITUACIONAL
+    - FORMATO_12B
+    Y lista los datasets de Presupuesto Público para ver si hay tabla de Contratos/SEACE.
+    """
+    cui_clean = cui.strip()
+    token_uuid = str(uuid.uuid4())
+    headers_rest = {
+        **HEADERS,
+        "Token": token_uuid,
+        "Content-Type": "application/json",
+        "Origin": "https://datosabiertos.mef.gob.pe",
+        "Referer": "https://datosabiertos.mef.gob.pe/"
+    }
+
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=20.0) as client:
+        filas_et, filas_sit, filas_f12b, r_presupuesto = await asyncio.gather(
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_EXPEDIENTES_ET, cui_clean, limite=10),
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_ESTADO_SITUACIONAL, cui_clean, limite=10),
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_FORMATO_12B, cui_clean, limite=10),
+            client.post(
+                f"{MEF_REST_BASE}/PortalWebCategoriaDetalle/v1.0/getRecursos",
+                json={"category": "presupuesto-publico", "page": 1, "tags": [""], "formats": [""], "search": "", "order": "asc"},
+                headers=headers_rest
+            ),
+            return_exceptions=True
         )
-        filas_sample = extraer_records_de_respuesta_mef(r_muestra.json()) if r_muestra.status_code == 200 else []
+
+        presupuesto_datasets = r_presupuesto.json() if isinstance(r_presupuesto, httpx.Response) else str(r_presupuesto)
+
         return {
-            "resource_id_seace": RESOURCE_PROCESOS_SEACE,
-            "columnas_oficiales_tabla_seace": list(filas_sample[0].keys()) if filas_sample else [],
-            "ejemplo_fila_general": filas_sample[0] if filas_sample else None,
-            "total_filas_encontradas_para_cui": len(filas_cui),
-            "filas_reales_del_cui": filas_cui
+            "cui": cui_clean,
+            "1_tabla_expedientes_tecnicos_ET": {
+                "total_filas": len(filas_et) if isinstance(filas_et, list) else 0,
+                "filas": filas_et if isinstance(filas_et, list) else str(filas_et)
+            },
+            "2_tabla_estado_situacional": {
+                "total_filas": len(filas_sit) if isinstance(filas_sit, list) else 0,
+                "filas": filas_sit if isinstance(filas_sit, list) else str(filas_sit)
+            },
+            "3_tabla_formato_12b": {
+                "total_filas": len(filas_f12b) if isinstance(filas_f12b, list) else 0,
+                "filas": filas_f12b if isinstance(filas_f12b, list) else str(filas_f12b)
+            },
+            "4_catalogo_presupuesto_publico": presupuesto_datasets
         }
 
 
@@ -326,9 +338,9 @@ async def consultar_obra_cui(cui: str):
         return CUI_MEMORY_CACHE[cui_clean]
 
     async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True) as client:
-        filas_detalle, filas_seace = await asyncio.gather(
+        filas_detalle, filas_comp = await asyncio.gather(
             buscar_filas_por_cui_en_recurso(client, RESOURCE_DETALLE_INV, cui_clean, limite=5),
-            buscar_filas_por_cui_en_recurso(client, RESOURCE_PROCESOS_SEACE, cui_clean, limite=30)
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_COMPONENTES, cui_clean, limite=35)
         )
 
         if not filas_detalle:
@@ -336,14 +348,14 @@ async def consultar_obra_cui(cui: str):
 
         registro = filas_detalle[0]
         resumen_ssi = construir_5_datos_importantes_ssi(cui_clean, registro)
-        resumen_seace = estructurar_5_datos_seace(cui_clean, filas_seace)
+        resumen_componentes = estructurar_componentes_limpios(cui_clean, filas_comp)
 
         respuesta = {
             "cui": cui_clean,
             "verificado": True,
-            "fuente": "API_DATOS_ABIERTOS_MEF (SSI + PROCESO_SELECCION_SEACE)",
+            "fuente": "API_DATOS_ABIERTOS_MEF",
             "resumen_ssi_5_datos_clave": resumen_ssi,
-            "resumen_seace": resumen_seace,
+            "resumen_componentes_fisicos_obra": resumen_componentes,
             "datos_proyecto": registro
         }
         CUI_MEMORY_CACHE[cui_clean] = respuesta
@@ -354,9 +366,3 @@ async def consultar_obra_cui(cui: str):
 async def obtener_solo_5_datos_ssi(cui: str):
     data = await consultar_obra_cui(cui)
     return data["resumen_ssi_5_datos_clave"]
-
-
-@app.get("/api/v1/obra/{cui}/resumen-seace")
-async def obtener_solo_datos_seace(cui: str):
-    data = await consultar_obra_cui(cui)
-    return data["resumen_seace"]

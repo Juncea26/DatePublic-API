@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, List, Union
 app = FastAPI(
     title="DatePublic API - Motor de Auditoría CUI Perú",
     description="API de Veeduría Ciudadana: SSI + Expedientes Técnicos + Estado Situacional/Riesgos + Componentes F8",
-    version="5.1.0"
+    version="5.1.1"
 )
 
 app.add_middleware(
@@ -23,7 +23,7 @@ CKAN_BASE = "https://api.datosabiertos.mef.gob.pe/DatosAbiertos/v1"
 CKAN_SEARCH = f"{CKAN_BASE}/datastore_search"
 MEF_REST_BASE = "https://datosabiertos.mef.gob.pe/Rest"
 
-# Resource IDs oficiales de Datos Abiertos MEF (100% accesibles desde Render)
+# Resource IDs oficiales de Datos Abiertos MEF (Accesibles desde Render)
 RESOURCE_DETALLE_INV = "f9cc4ba0-931a-4b70-86c9-eacbd8c68596"        # DETALLE_INVERSIONES.csv (SSI)
 RESOURCE_EXPEDIENTES_ET = "b782e8d4-cce5-45c8-8675-6959100aa360"     # INVERSIONES_ET.csv (Resoluciones y Modificaciones ET)
 RESOURCE_ESTADO_SITUACIONAL = "2c20b8e2-7bd9-41ba-8239-8f8c9571935a" # ESTADO_SITUACIONAL.csv (Situación F12B y Riesgos)
@@ -31,7 +31,6 @@ RESOURCE_COMPONENTES = "79e51378-613e-4886-9743-1426c064f8f1"        # Component
 RESOURCE_CIERRE_INV = "7c6fe48e-f124-4d21-b32b-68f7e59f29b8"         # CIERRE_INVERSIONES.csv (Formato 9)
 
 CUI_MEMORY_CACHE: Dict[str, Dict[str, Any]] = {}
-DETECTED_COLUMNS_CACHE: Dict[str, List[str]] = {}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -89,20 +88,6 @@ def extraer_records_de_respuesta_mef(raw_json: Union[Dict, List]) -> List[Dict[s
     return []
 
 
-def descubrir_columnas_cui_desde_filas(records: List[Dict[str, Any]]) -> List[str]:
-    if not records:
-        return []
-    primera_fila = records[0]
-    todas_las_columnas = list(primera_fila.keys())
-    keywords = ["UNICO", "CUI", "CODIGO", "INVERSION", "PROYECTO", "SNIP", "COD"]
-    prioritarias = [col for col in todas_las_columnas if any(k in col.upper() for k in keywords)]
-    for col, val in primera_fila.items():
-        val_str = str(val).strip().split(".")[0]
-        if val_str.isdigit() and 6 <= len(val_str) <= 8 and col not in prioritarias and col != "_id":
-            prioritarias.append(col)
-    return prioritarias if prioritarias else todas_las_columnas[:4]
-
-
 def fila_contiene_cui(row: Dict[str, Any], cui: str) -> bool:
     for v in row.values():
         if v is None:
@@ -117,27 +102,17 @@ async def buscar_filas_por_cui_en_recurso(
     client: httpx.AsyncClient,
     resource_id: str,
     cui: str,
-    limite: int = 30
+    limite: int = 35
 ) -> List[Dict[str, Any]]:
-    if resource_id not in DETECTED_COLUMNS_CACHE:
-        try:
-            r_sample = await client.get(CKAN_SEARCH, params={"resource_id": resource_id, "limit": 2}, timeout=10.0)
-            if r_sample.status_code == 200:
-                filas_muestra = extraer_records_de_respuesta_mef(r_sample.json())
-                if filas_muestra:
-                    DETECTED_COLUMNS_CACHE[resource_id] = descubrir_columnas_cui_desde_filas(filas_muestra)
-        except Exception:
-            pass
-
-    columnas_cui = DETECTED_COLUMNS_CACHE.get(resource_id, ["CODIGO_UNICO"])
-
+    """
+    Consulta en paralelo por texto completo (q), filtro string y filtro numérico
+    sobre la columna oficial CODIGO_UNICO para garantizar 0 pérdidas de filas.
+    """
     consultas = [
-        client.get(CKAN_SEARCH, params={"resource_id": resource_id, "q": cui, "limit": limite}, timeout=14.0),
+        client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": f'{{"CODIGO_UNICO":"{cui}"}}', "limit": limite}, timeout=16.0),
+        client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": f'{{"CODIGO_UNICO":{int(cui)}}}', "limit": limite}, timeout=16.0),
+        client.get(CKAN_SEARCH, params={"resource_id": resource_id, "q": cui, "limit": limite}, timeout=16.0),
     ]
-    for col in columnas_cui[:2]:
-        consultas.append(
-            client.get(CKAN_SEARCH, params={"resource_id": resource_id, "filters": f'{{"{col}":"{cui}"}}', "limit": limite}, timeout=14.0)
-        )
 
     respuestas = await asyncio.gather(*consultas, return_exceptions=True)
     filas_unicas: List[Dict[str, Any]] = []
@@ -298,18 +273,30 @@ def estructurar_componentes_limpios(cui: str, filas_comp: List[Dict[str, Any]]) 
     seleccionadas = ejecucion_c if ejecucion_c else con_costo
 
     componentes_limpios = []
+    vistos_comp = set()
+
     for r in seleccionadas:
+        prod = str(r.get("DES_PRODUCTO", "No especificado")).strip()
+        tipo_comp = str(r.get("DES_TIPO_COMPONENTE", "")).strip()
+        accion = str(r.get("DES_ACCION") or r.get("DES_OBSERVACIONES", "")).strip()
+        costo_num = a_float(r.get("COSTO_INVERSION"))
+
+        clave_c = f"{prod}_{tipo_comp}_{accion}_{costo_num}"
+        if clave_c in vistos_comp:
+            continue
+        vistos_comp.add(clave_c)
+
         meta_cap = str(r.get("VAL_META_CAPAC", "")).strip()
         um_cap = str(r.get("DES_UM_CAPAC", "")).strip()
         meta_prod = str(r.get("VAL_META_PRODU", "")).strip()
         um_prod = str(r.get("DES_UM_PRODU", "")).strip()
 
         componentes_limpios.append({
-            "1_componente_producto": r.get("DES_PRODUCTO", "No especificado"),
-            "2_tipo_y_accion": f"{r.get('DES_TIPO_COMPONENTE', '')} - {r.get('DES_ACCION') or r.get('DES_OBSERVACIONES', '')}".strip(" -"),
+            "1_componente_producto": prod,
+            "2_tipo_y_accion": f"{tipo_comp} - {accion}".strip(" -"),
             "3_meta_fisica": f"{meta_cap} {um_cap}".strip() if meta_cap else f"{meta_prod} {um_prod}".strip(),
             "4_etapa_y_periodo": f"{r.get('DES_ETAPA', '')} ({r.get('PERIODO', '')})".strip(" ()"),
-            "5_costo_componente": formatear_soles(a_float(r.get("COSTO_INVERSION")))
+            "5_costo_componente": formatear_soles(costo_num)
         })
 
     return {
@@ -325,7 +312,7 @@ def estructurar_componentes_limpios(cui: str, filas_comp: List[Dict[str, Any]]) 
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v5.1.0 - Auditoría Integral de Obras Públicas",
+        "servicio": "DatePublic API v5.1.1 - Auditoría Integral de Obras Públicas",
         "endpoints": {
             "auditoria_completa_cui": "/api/v1/obra/{cui}",
             "solo_5_datos_ssi": "/api/v1/obra/{cui}/resumen-ssi",
@@ -337,10 +324,6 @@ def root():
 
 @app.get("/api/v1/explorar-consulta-amigable")
 async def obtener_resource_ids_consulta_amigable():
-    """
-    Obtiene los resource_id del dataset 'comparacion-de-presupuesto-ejecucion-gasto' (Consulta Amigable SIAF)
-    y las páginas 2, 3 y 4 del catálogo de Presupuesto Público.
-    """
     token_uuid = str(uuid.uuid4())
     headers_rest = {
         **HEADERS,
@@ -394,7 +377,7 @@ async def consultar_obra_cui(cui: str):
             buscar_filas_por_cui_en_recurso(client, RESOURCE_DETALLE_INV, cui_clean, limite=5),
             buscar_filas_por_cui_en_recurso(client, RESOURCE_EXPEDIENTES_ET, cui_clean, limite=15),
             buscar_filas_por_cui_en_recurso(client, RESOURCE_ESTADO_SITUACIONAL, cui_clean, limite=20),
-            buscar_filas_por_cui_en_recurso(client, RESOURCE_COMPONENTES, cui_clean, limite=35)
+            buscar_filas_por_cui_en_recurso(client, RESOURCE_COMPONENTES, cui_clean, limite=40)
         )
 
         if not filas_detalle:
@@ -414,7 +397,18 @@ async def consultar_obra_cui(cui: str):
             "resumen_expedientes_y_modificaciones": resumen_et,
             "resumen_estado_situacional_y_riesgos": resumen_situacion,
             "resumen_componentes_fisicos_obra": resumen_componentes,
-            "datos_proyecto": registro
+            "datos_proyecto": registro,
+            "enlaces_ecosistema": {
+                "ssi_mef": f"https://ofi5.mef.gob.pe/ssi/?codigo={cui_clean}",
+                "ficha_invierte": f"https://ofi5.mef.gob.pe/invierte/ejecucion/verFichaEjecucion/{cui_clean}",
+                "seace": "https://prod2.seace.gob.pe/seacebus-uiwd-pub/buscadorPublico/buscadorPublico.xhtml",
+                "infobras": "https://infobras.contraloria.gob.pe/infobrasweb",
+                "consulta_amigable": "https://apps5.mineco.gob.pe/transparencia/Navegador/default.aspx",
+                "informes_cgr": "https://appbp.contraloria.gob.pe/BuscadorCGR/Informes/Avanzado.html",
+                "fup_oece": "https://apps.oece.gob.pe/perfilprov-ui/",
+                "djic_cgr": "https://appdji.contraloria.gob.pe/djic/",
+                "cuaderno_obra": "https://apps.osce.gob.pe/buscador-cuaderno-obra/search"
+            }
         }
         CUI_MEMORY_CACHE[cui_clean] = respuesta
         return respuesta

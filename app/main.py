@@ -7,8 +7,8 @@ from typing import Dict, Any, Optional, List, Union
 
 app = FastAPI(
     title="DatePublic API - Motor CUI Perú",
-    description="API de Veeduría Ciudadana (SSI-MEF + Extractor de Catálogo main-HSI2723K.js y eap.oece.gob.pe)",
-    version="4.8.2"
+    description="API de Veeduría Ciudadana (SSI-MEF + Extractor Exacto de Endpoints eap.oece.gob.pe y MEF)",
+    version="4.8.3"
 )
 
 app.add_middleware(
@@ -125,48 +125,57 @@ def construir_5_datos_importantes_ssi(cui: str, fuente: Dict[str, Any]) -> Dict[
 
 
 # =========================================================
-# MÓDULO 2: INSPECTOR DE main-HSI2723K.js (MEF) Y eap.oece.gob.pe (OSCE)
+# MÓDULO 2: EXTRACTOR DE ENDPOINTS DE BÚSQUEDA EN EAP.OECE.GOB.PE Y MEF
 # =========================================================
 @app.get("/api/v1/probar-fuentes-peruanas/{cui}")
-async def descubrir_endpoints_exactos_mef_y_oece(cui: str):
-    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=12.0) as client:
-        # 1. Leer el bundle de Angular del Portal de Datos Abiertos del MEF
-        r_mef_js, r_cuaderno_js, r_oece_test = await asyncio.gather(
+async def descubrir_rutas_exactas_busqueda(cui: str):
+    async with httpx.AsyncClient(headers=HEADERS, verify=False, follow_redirects=True, timeout=15.0) as client:
+        r_mef_js, r_cuaderno_html, r_cuaderno_js, r_fup_js = await asyncio.gather(
             client.get("https://datosabiertos.mef.gob.pe/main-HSI2723K.js"),
+            client.get("https://apps.osce.gob.pe/buscador-cuaderno-obra/"),
             client.get("https://apps.osce.gob.pe/buscador-cuaderno-obra/main-es2015.938f7af282f717dbf663.js"),
-            client.get("https://eap.oece.gob.pe/soec-bus/1.0/ubigeo/selector/dptos"),
+            client.get("https://apps.oece.gob.pe/perfilprov-ui/main.2b917411c9b9e438549e.js"),
             return_exceptions=True
         )
 
-        mef_info: Dict[str, Any] = {}
-        if isinstance(r_mef_js, httpx.Response) and r_mef_js.status_code == 200:
-            txt_mef = r_mef_js.text
-            mef_info["size_bytes"] = len(txt_mef)
-            mef_info["uuids_resource_id"] = list(set(re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', txt_mef, re.I)))
-            mef_info["urls_mef"] = list(set(re.findall(r'https?://[a-zA-Z0-9\.\-_/\?:=&]+', txt_mef)))
-            # Extraer todas las rutas de API o endpoints del backend de datosabiertos.mef.gob.pe
-            mef_info["endpoints_backend_mef"] = list(set(re.findall(r'["\']([a-zA-Z0-9_\-/]*(?:api|DatosAbiertos|dataset|resource|package|search|categoria|recurso|inversion|seace)[a-zA-Z0-9_\-/\?=&]*)["\']', txt_mef, re.I)))[:60]
+        # 1. En main-HSI2723K.js del MEF: buscar dónde hace las peticiones HTTP para traer datasets y recursos
+        mef_api_calls = []
+        if isinstance(r_mef_js, httpx.Response):
+            txt_m = r_mef_js.text
+            mef_api_calls = re.findall(r'.{0,80}(?:http\.get|http\.post|DatosAbiertos|apiUrl|baseUrl|inversion-publica).{0,140}', txt_m)
 
-        cuaderno_rutas: Dict[str, Any] = {}
-        if isinstance(r_cuaderno_js, httpx.Response) and r_cuaderno_js.status_code == 200:
+        # 2. En Cuaderno de Obra: buscar runtime.js para ver si hay chunks lazy-loaded y extraer todas las llamadas de urlBaseSoecBus / urlBaseSoecCons / urlBaseSoecCodi
+        cuaderno_endpoints = []
+        chunks_detectados = []
+        if isinstance(r_cuaderno_html, httpx.Response):
+            runtime_match = re.findall(r'src=["\']([^"\']*runtime-es2015[^"\']*\.js)["\']', r_cuaderno_html.text)
+            if runtime_match:
+                rt_url = "https://apps.osce.gob.pe/" + runtime_match[0].lstrip("/")
+                r_rt = await client.get(rt_url)
+                if r_rt.status_code == 200:
+                    chunks_detectados = re.findall(r'[0-9]+:"[0-9a-f]{20}"', r_rt.text)
+
+        if isinstance(r_cuaderno_js, httpx.Response):
             txt_c = r_cuaderno_js.text
-            # Extraer cómo se usan las variables soec-bus, soec-codi y soec-cons dentro del código
-            contextos_soec = re.findall(r'.{0,60}(?:soec-bus|soec-codi|soec-cons|urlEndPoint|buscador|cuaderno).{0,120}', txt_c)
-            cuaderno_rutas["fragmentos_codigo_soec"] = contextos_soec[:45]
+            cuaderno_endpoints = re.findall(
+                r'.{0,50}(?:urlBaseSoecBus|urlBaseSoecCons|urlBaseSoecCodi|urlBaseSoecAdm|this\.http\.get|this\.http\.post).{0,140}',
+                txt_c
+            )
 
-        oece_status = {}
-        if isinstance(r_oece_test, httpx.Response):
-            oece_status = {
-                "status": r_oece_test.status_code,
-                "muestra": r_oece_test.text[:300]
-            }
-        else:
-            oece_status = {"error": str(r_oece_test)}
+        # 3. En FUP Proveedor: extraer cómo arma las URLs de _urlService, _urlServiceFup y _urlServiceOS
+        fup_endpoints = []
+        if isinstance(r_fup_js, httpx.Response):
+            txt_f = r_fup_js.text
+            fup_endpoints = re.findall(
+                r'.{0,40}(?:_urlService|_urlServiceFup|_urlServiceOS|ficha-proveedor-cns|perfilprov-bus|expprov-bus).{0,130}',
+                txt_f
+            )
 
         return {
-            "1_mef_main_js_extraido": mef_info,
-            "2_eap_oece_gob_pe_accesible_desde_render": oece_status,
-            "3_fragmentos_endpoints_cuaderno_obra": cuaderno_rutas
+            "1_mef_llamadas_http_internas": mef_api_calls[:40],
+            "2_cuaderno_obra_chunks": chunks_detectados,
+            "3_cuaderno_obra_endpoints_http": cuaderno_endpoints[:60],
+            "4_fup_proveedor_endpoints_http": fup_endpoints[:50]
         }
 
 
@@ -264,7 +273,7 @@ async def buscar_cui_en_mef(
 @app.get("/")
 def root():
     return {
-        "servicio": "DatePublic API v4.8.2 - SSI Estable + Extractor MEF/OECE",
+        "servicio": "DatePublic API v4.8.3 - Extractor Exacto eap.oece.gob.pe y MEF",
         "endpoints": {
             "obra_completa": "/api/v1/obra/{cui}",
             "resumen_ssi": "/api/v1/obra/{cui}/resumen-ssi",
